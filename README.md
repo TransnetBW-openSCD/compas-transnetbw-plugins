@@ -12,6 +12,16 @@ A monorepo containing Svelte/Vite applications and supporting libraries that ext
 - location-manager – Manage locations and metadata
 - tsld – Single line diagram utilities
 
+The following plugins are automatically deployed to GitHub Pages on every push to main:
+
+- **engineering-wizard**: https://transnetbw-openscd.github.io/compas-transnetbw-plugins/bearingpoint/compas/plugins/engineering-wizard/index.js
+- **template-generator**: https://transnetbw-openscd.github.io/compas-transnetbw-plugins/bearingpoint/compas/plugins/template-generator/index.js
+- **history-viewer**: https://transnetbw-openscd.github.io/compas-transnetbw-plugins/bearingpoint/compas/plugins/history-viewer/index.js
+- **archive-explorer**: https://transnetbw-openscd.github.io/compas-transnetbw-plugins/bearingpoint/compas/plugins/archive-explorer/index.js
+- **location-viewer**: https://transnetbw-openscd.github.io/compas-transnetbw-plugins/bearingpoint/compas/plugins/location-viewer/index.js
+- **location-manager**: https://transnetbw-openscd.github.io/compas-transnetbw-plugins/bearingpoint/compas/plugins/location-manager/index.js
+- **type-distributor**: https://transnetbw-openscd.github.io/compas-transnetbw-plugins/bearingpoint/compas/plugins/type-distributor/index.js
+
 Libraries live under libs/ and provide shared UI components, API clients, and utilities.
 
 ## Prerequisites
