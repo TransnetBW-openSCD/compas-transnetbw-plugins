@@ -1,5 +1,35 @@
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
+.mdc-text-field--focused:not(.mdc-text-field--disabled) .mdc-floating-label {
+  color: var(--mdc-theme-primary) !important;
+}
+
+* {
+  --mdc-switch-selected-track-color: var(--mdc-theme-primary, #6B9197) !important;
+  --mdc-switch-selected-focus-track-color: var(--mdc-theme-primary, #6B9197) !important;
+  --mdc-switch-selected-hover-track-color: var(--mdc-theme-primary, #6B9197) !important;
+  --mdc-switch-selected-pressed-track-color: var(--mdc-theme-primary, #6B9197) !important;
+  --mdc-switch-unselected-icon-color: var(--base2) !important;
+  --mdc-switch-selected-handle-color: var(--mdc-theme-primary, #676778) !important;
+  --mdc-switch-selected-hover-handle-color: var(--mdc-theme-primary, #676778) !important;
+  --mdc-switch-selected-pressed-handle-color: var(--mdc-theme-primary, #676778) !important;
+  --mdc-switch-selected-focus-handle-color: var(--mdc-theme-primary, #676778) !important;
+}
+
+.mdc-data-table__sort-icon-button {
+  margin: 0 !important;
+}
+
+.mdc-data-table__logical-node-row:hover {
+  cursor: pointer;
+  background: #D9D800 !important;
+}
+
+.smui-autocomplete,
+.smui-autocomplete .mdc-text-field {
+  width: 100%;
+}
+
 /* ─── Template Generator – Typography tokens ──────────────────────────────── */
 
 /*
@@ -43,7 +73,8 @@ body {
 }
 
 body {
-  color: #333;
+  color: var(--oscd-plugin-text, #333);
+  background-color: var(--oscd-plugin-surface, white);
   margin: 0;
   padding: 8px;
   box-sizing: border-box;
@@ -73,7 +104,7 @@ body {
 }
 
 .oscd-app {
-  color: #333;
+  color: var(--oscd-plugin-text, #333);
   margin: 0;
   padding: 8px;
   box-sizing: border-box;
@@ -125,7 +156,7 @@ button:disabled {
   color: #999;
 }
 
-button:not(:disabled):active {
+button:not(:disabled):not(.mdc-button):active {
   background-color: #ddd;
 }
 
@@ -195,4 +226,13 @@ button:focus {
   display: inline-flex !important;
   align-items: center;
   justify-content: center;
+}
+
+/* ─── Responsive font-size tokens for notebook viewports ─────────────────── */
+@media (max-width: 1400px) {
+  :root {
+    --tg-font-size-heading:    1.1rem;
+    --tg-font-size-value:      1rem;
+    --tg-font-size-subheading: 0.9375rem;
+  }
 }
