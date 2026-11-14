@@ -9,10 +9,11 @@ import {
 } from '@testing-library/svelte';
 import { openDialog } from '@oscd-transnet-plugins/oscd-services/dialog';
 import { toastService } from '@oscd-transnet-plugins/oscd-services/toast';
-import type { XPathValidation } from '@oscd-transnet-plugins/shared';
+import type { Process, XPathValidation } from '@oscd-transnet-plugins/shared';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import {
   engineeringProcesses,
+  engineeringProcessesStatus,
   corePlugins,
   selectedEngineeringProcess,
 } from '../../features/processes/stores.svelte';
@@ -22,6 +23,7 @@ import ProcessEdit from './ProcessEdit.view.svelte';
 
 vi.mock('../../features/processes/repository.svelte', () => ({
   saveProcess: vi.fn(),
+  isProcessLocal: (id: string) => engineeringProcessesStatus.localProcessIds.includes(id),
 }));
 vi.mock('@oscd-transnet-plugins/oscd-services/dialog', () => ({
   openDialog: vi.fn(),
@@ -43,8 +45,25 @@ function rule(title: string): XPathValidation {
   return { id: `rule-${title}`, title, description: '', context: '//scl:Bay', assert: '@name' };
 }
 
+function publishSave(process: Process, version: string) {
+  const saved = { ...JSON.parse(JSON.stringify(process)) as Process, version };
+  engineeringProcesses.processes = [
+    ...engineeringProcesses.processes.filter(({ id }) => id !== saved.id), saved,
+  ];
+  return { version, target: 'backend' as const };
+}
+
+function editorProcess(): Process {
+  const process = selectedEngineeringProcess.process;
+  if (!process) throw new Error('Missing editor draft');
+  return process;
+}
+
 beforeEach(() => {
   vi.resetAllMocks();
+  engineeringProcessesStatus.backend = 'unknown';
+  engineeringProcessesStatus.localProcessIds = [];
+  localStorage.clear();
   vi.stubGlobal(
     'ResizeObserver',
     class {
@@ -82,6 +101,7 @@ beforeEach(() => {
   selectedEngineeringProcess.process = engineeringProcesses.processes[0];
   corePlugins.plugins = [];
   vi.mocked(openDialog).mockResolvedValue({ type: 'confirm' });
+  vi.mocked(saveProcess).mockImplementation(async (process) => publishSave(process, process.version));
 });
 
 afterEach(() => {
@@ -92,14 +112,13 @@ afterEach(() => {
 });
 
 function startDraft() {
-  selectedEngineeringProcess.process = null;
-  selectedEngineeringProcess.draft = {
+  selectedEngineeringProcess.beginEditing({
     id: '',
     name: '',
     description: '',
     version: '1.0.0',
     pluginGroups: [{ title: 'Ungrouped', plugins: [] }],
-  };
+  }, 'new');
 }
 
 it('creates a process with plugins and rules using the shared editor before its first save', async () => {
@@ -136,7 +155,6 @@ it('creates a process with plugins and rules using the shared editor before its 
   expect(engineeringProcesses.processes).toHaveLength(1);
   expect(saveProcess).not.toHaveBeenCalled();
 
-  vi.mocked(saveProcess).mockResolvedValueOnce('1.0.0');
   await fireEvent.click(create);
 
   expect(saveProcess).toHaveBeenCalledWith(
@@ -172,7 +190,6 @@ it('keeps a colliding draft separate and creates it only after confirming a uniq
   expect(engineeringProcesses.processes).toHaveLength(1);
   expect(selectedEngineeringProcess.draft?.id).toBe('process-a');
 
-  vi.mocked(saveProcess).mockResolvedValueOnce('1.0.0');
   await fireEvent.click(getByRole('button', { name: 'Create', exact: true }));
   expect(openDialog).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({
     title: 'Process ID already in use',
@@ -199,10 +216,32 @@ it('retains a failed creation for retry without adding an unsaved process to the
   expect(onReturnToList).not.toHaveBeenCalled();
   expect(getByRole<HTMLButtonElement>('button', { name: 'Create', exact: true }).disabled).toBe(false);
 
-  vi.mocked(saveProcess).mockResolvedValueOnce('1.0.0');
   await fireEvent.click(getByRole('button', { name: 'Create', exact: true }));
   expect(engineeringProcesses.processes).toHaveLength(2);
   expect(onReturnToList).toHaveBeenCalledOnce();
+});
+
+it('creates a persistent local process and returns to the list without a backend', async () => {
+  const repository = await vi.importActual<typeof import('../../features/processes/repository.svelte')>(
+    '../../features/processes/repository.svelte',
+  );
+  vi.mocked(saveProcess).mockImplementationOnce(repository.saveProcess);
+  engineeringProcessesStatus.backend = 'unavailable';
+  startDraft();
+  const onReturnToList = vi.fn();
+  const { getByRole } = render(ProcessEdit, { creating: true, onReturnToList });
+  await fireEvent.input(getByRole('textbox', { name: 'Process name' }), {
+    target: { value: 'Offline creation' },
+  });
+  await fireEvent.click(getByRole('button', { name: 'Create', exact: true }));
+  await waitFor(() => expect(onReturnToList).toHaveBeenCalledOnce());
+  expect(engineeringProcesses.processes.some(({ id }) => id === 'offline-creation')).toBe(true);
+  expect(engineeringProcessesStatus.localProcessIds).toContain('offline-creation');
+  expect(toastService.success).toHaveBeenCalledWith(
+    'Process saved locally', expect.stringContaining('saved in this browser. Use Sync'),
+  );
+  const { readLocalProcesses } = await import('../../features/processes/local-processes');
+  expect(readLocalProcesses()).toMatchObject([{ id: 'offline-creation' }]);
 });
 
 it('confirms discarding a draft and never saves it when leaving the editor', async () => {
@@ -292,7 +331,7 @@ it('switches the stepper layout using available plugin width rather than window 
   }
 });
 
-it('restores an existing process when discarding changes from the bottom bar', async () => {
+it('discards only the existing-process draft without changing the published list', async () => {
   const onReturnToList = vi.fn();
   const { getByRole } = render(ProcessEdit, { onReturnToList });
   await fireEvent.input(getByRole('textbox', { name: 'Process name' }), {
@@ -301,7 +340,8 @@ it('restores an existing process when discarding changes from the bottom bar', a
   vi.mocked(openDialog).mockResolvedValueOnce({ type: 'cancel' });
   await fireEvent.click(getByRole('button', { name: 'Discard Changes' }));
   expect(onReturnToList).not.toHaveBeenCalled();
-  expect(engineeringProcesses.processes[0].name).toBe('Unsaved name');
+  expect(engineeringProcesses.processes[0].name).toBe('Process A');
+  expect(selectedEngineeringProcess.draft?.name).toBe('Unsaved name');
 
   await fireEvent.click(getByRole('button', { name: 'Discard Changes' }));
   expect(engineeringProcesses.processes[0].name).toBe('Process A');
@@ -309,11 +349,46 @@ it('restores an existing process when discarding changes from the bottom bar', a
   expect(saveProcess).not.toHaveBeenCalled();
 });
 
+it('keeps an existing draft across a published refresh and discards without writing back the old snapshot', async () => {
+    const onReturnToList = vi.fn();
+    const { getByRole } = render(ProcessEdit, { onReturnToList });
+    await fireEvent.input(getByRole('textbox', { name: 'Process name' }), { target: { value: 'Draft edit' } });
+    const refreshed = { ...engineeringProcesses.processes[0], name: 'Refreshed name', version: '2.0.0' };
+    engineeringProcesses.processes = [refreshed];
+    await waitFor(() => expect(getByRole<HTMLInputElement>('textbox', { name: 'Process name' }).value).toBe('Draft edit'));
+    await fireEvent.click(getByRole('button', { name: 'Discard Changes' }));
+    expect(engineeringProcesses.processes).toEqual([refreshed]);
+    expect(selectedEngineeringProcess.draft).toBeNull();
+    expect(saveProcess).not.toHaveBeenCalled();
+    expect(onReturnToList).toHaveBeenCalledOnce();
+});
+
+it('retains failed existing-process edits for retry without publishing them', async () => {
+    const original = engineeringProcesses.processes[0];
+    const onReturnToList = vi.fn();
+    const { getByRole } = render(ProcessEdit, { onReturnToList });
+    await fireEvent.input(getByRole('textbox', { name: 'Process name' }), { target: { value: 'Retry edit' } });
+    vi.mocked(openDialog).mockResolvedValueOnce({ type: 'confirm', data: 'patch' });
+    vi.mocked(saveProcess).mockRejectedValueOnce(new Error('Backend rejected save'));
+    await fireEvent.click(getByRole('button', { name: 'Save', exact: true }));
+    await waitFor(() => expect(toastService.error).toHaveBeenCalledWith('Save failed', 'Backend rejected save'));
+    expect(engineeringProcesses.processes[0]).toBe(original);
+    expect(original.name).toBe('Process A');
+    expect(selectedEngineeringProcess.draft?.name).toBe('Retry edit');
+    expect(selectedEngineeringProcess.mode).toBe('existing');
+    expect(onReturnToList).not.toHaveBeenCalled();
+    vi.mocked(openDialog).mockResolvedValueOnce({ type: 'confirm', data: 'patch' });
+    await fireEvent.click(getByRole('button', { name: 'Save', exact: true }));
+    await waitFor(() => expect(onReturnToList).toHaveBeenCalledOnce());
+    expect(engineeringProcesses.processes[0].name).toBe('Retry edit');
+});
+
 it('disables all bottom bar actions while saving', async () => {
   let finishSave!: (version: string) => void;
-  vi.mocked(saveProcess).mockReturnValueOnce(new Promise((resolve) => {
-    finishSave = resolve;
-  }));
+  vi.mocked(saveProcess).mockImplementationOnce(async (process) => {
+    const version = await new Promise<string>((resolve) => { finishSave = resolve; });
+    return publishSave(process, version);
+  });
   const onReturnToList = vi.fn();
   const { getByRole } = render(ProcessEdit, { onReturnToList });
   await fireEvent.click(getByRole('button', { name: 'Next step' }));
@@ -350,7 +425,7 @@ it('always shows Save for an existing process and retains version-bump saving fo
   expect(onReturnToList).not.toHaveBeenCalled();
 
   vi.mocked(openDialog).mockResolvedValueOnce({ type: 'confirm', data: 'minor' });
-  vi.mocked(saveProcess).mockResolvedValueOnce('1.1.0');
+  vi.mocked(saveProcess).mockImplementationOnce(async (process) => publishSave(process, '1.1.0'));
   await fireEvent.click(getByRole('button', { name: 'Save', exact: true }));
   await waitFor(() => expect(onReturnToList).toHaveBeenCalledOnce());
   expect(openDialog).toHaveBeenLastCalledWith(expect.anything(), { currentVersion: '1.0.0' });
@@ -449,7 +524,7 @@ it.each(['Edit validation', 'Remove validation'])(
     await waitFor(() => expect(toastService.success).toHaveBeenCalled());
     finishDialog({ type: 'confirm', data: rule('Edited second') });
 
-    const plugin = engineeringProcesses.processes[0].pluginGroups[0].plugins[0];
+    const plugin = editorProcess().pluginGroups[0].plugins[0];
     await waitFor(() => expect(plugin.validations?.map(({ title }) => title)).toEqual(
       action === 'Edit validation'
         ? ['Alpha', 'Edited second', 'First', 'Third']
@@ -471,7 +546,7 @@ it('reports when the edit target is replaced while its dialog is open', async ()
   let finishDialog!: (result: { type: 'confirm'; data: XPathValidation }) => void;
   vi.mocked(openDialog).mockReturnValueOnce(new Promise((resolve) => { finishDialog = resolve; }));
   await fireEvent.click(within(row).getByRole('button', { name: 'Edit validation' }));
-  const plugin = engineeringProcesses.processes[0].pluginGroups[0].plugins[0];
+  const plugin = editorProcess().pluginGroups[0].plugins[0];
   plugin.validations = [rule('Second')];
   finishDialog({ type: 'confirm', data: rule('Edited second') });
 
@@ -501,7 +576,7 @@ it('skips duplicate imported IDs and reports renamed rules while highlighting on
   expect(toastService.warn).toHaveBeenCalledWith(
     expect.any(String), expect.stringContaining('1 duplicate rule ID skipped'), 15_000,
   );
-  const plugin = engineeringProcesses.processes[0].pluginGroups[0].plugins[0];
+  const plugin = editorProcess().pluginGroups[0].plugins[0];
   expect(plugin.validations?.map(({ title }) => title))
     .toEqual(['Alpha', 'First', 'First (copy)', 'Second', 'Third']);
   expect(getByRole('checkbox', { name: 'Select validation First (copy)' }).closest('tr')
@@ -523,7 +598,7 @@ it('sorts and highlights a manually added rule and gives duplicates a fresh ID',
     type: 'confirm', data: { ...rule('Alpha'), id: undefined },
   });
   await fireEvent.click(getByRole('button', { name: 'Add validation' }));
-  const plugin = engineeringProcesses.processes[0].pluginGroups[0].plugins[0];
+  const plugin = editorProcess().pluginGroups[0].plugins[0];
   expect(plugin.validations?.map(({ title }) => title)).toEqual(['Alpha', 'First', 'Second', 'Third']);
   expect(plugin.validations?.[0].id).toEqual(expect.any(String));
   const alphaRow = getByRole('checkbox', { name: 'Select validation Alpha' }).closest('tr');
@@ -664,7 +739,7 @@ it('removes selected rules with one confirmation without deleting shifted indexe
   ).toBe(true);
   expect(toolbar.getByRole('status').textContent?.trim()).toBe('1 rule');
   expect(
-    engineeringProcesses.processes[0].pluginGroups[0].plugins[0].validations,
+    editorProcess().pluginGroups[0].plugins[0].validations,
   ).toEqual([rule('Second')]);
   expect(
     getByRole<HTMLInputElement>('checkbox', {
@@ -684,7 +759,7 @@ it('keeps checked rules when bulk removal is cancelled', async () => {
   await fireEvent.click(getByRole('button', { name: 'Delete', exact: true }));
 
   expect(
-    engineeringProcesses.processes[0].pluginGroups[0].plugins[0].validations,
+    editorProcess().pluginGroups[0].plugins[0].validations,
   ).toHaveLength(3);
   expect(
     getByRole<HTMLInputElement>('checkbox', { name: 'Select all rows' })
@@ -751,7 +826,7 @@ it.each([' sEcOnD ', 'BayTwo', '@special'])(
       data: editedRule,
     });
     await fireEvent.click(getByRole('button', { name: 'Edit validation' }));
-    expect(plugin.validations.map((entry) => entry.title)).toEqual([
+    expect(editorProcess().pluginGroups[0].plugins[0].validations?.map((entry) => entry.title)).toEqual([
       'First',
       'Second edited',
       'Third',
@@ -787,7 +862,7 @@ it('limits bulk deletion and export to visible selected rules without losing hid
 
   expect(openDialog).toHaveBeenCalledTimes(1);
   expect(
-    engineeringProcesses.processes[0].pluginGroups[0].plugins[0].validations,
+    editorProcess().pluginGroups[0].plugins[0].validations,
   ).toEqual([rule('First'), rule('Second')]);
   expect(getByRole('status').textContent?.trim()).toBe('0 rules');
   expect(getByText('No matching validation rules.')).toBeTruthy();

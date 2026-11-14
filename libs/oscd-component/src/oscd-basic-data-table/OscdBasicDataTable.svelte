@@ -25,6 +25,8 @@
     items?: T[];
     /** Column definitions in display order. */
     columns?: readonly Column[];
+    /** Optional custom cell snippets keyed by column key. */
+    cells?: Record<string, import('svelte').Snippet<[{ item: T }]>>;
     /** Fixed layout lets columns without a width share the remaining space. */
     tableLayout?: 'auto' | 'fixed';
     actionsWidth?: string;
@@ -74,6 +76,7 @@
   let {
     items = [],
     columns = [],
+    cells = {},
     tableLayout = 'auto',
     actionsWidth,
     loading = false,
@@ -359,7 +362,11 @@
               class={col.bold ? 'cell-bold' : ''}
               title={col.tooltip ? String(cellValue(item, col.key) ?? '') : undefined}
             >
-              {cellValue(item, col.key) ?? ''}
+              {#if cells[col.key]}
+                {@render cells[col.key]?.({ item })}
+              {:else}
+                {cellValue(item, col.key) ?? ''}
+              {/if}
             </Cell>
           {/each}
           {#if showActions}

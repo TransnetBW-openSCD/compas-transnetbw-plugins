@@ -13,11 +13,21 @@ export const engineeringProcessesStatus = $state<{
   error: string;
   saving: boolean;
   saveError: string;
+  backend: 'unknown' | 'available' | 'unavailable';
+  backendError: string;
+  localProcessIds: string[];
+  syncingProcessIds: string[];
+  localReadError: string;
 }>({
   loading: false,
   error: '',
   saving: false,
   saveError: '',
+  backend: 'unknown',
+  backendError: '',
+  localProcessIds: [],
+  syncingProcessIds: [],
+  localReadError: '',
 });
 
 // ---------------------------------------------------------------------------
@@ -34,13 +44,21 @@ function findProcess(id: string | null): Process | null {
 class SelectedProcessState {
   #id = $state<string | null>(null);
   draft = $state<Process | null>(null);
+  mode = $state<'view' | 'existing' | 'new'>('view');
 
   get process(): Process | null {
     return this.draft ?? findProcess(this.#id);
   }
   set process(p: Process | null) {
     this.draft = null;
+    this.mode = 'view';
     this.#id = p?.id ?? null;
+  }
+
+  beginEditing(process: Process, mode: 'existing' | 'new'): void {
+    this.#id = process.id;
+    this.mode = mode;
+    this.draft = structuredClone($state.snapshot(process));
   }
 }
 
