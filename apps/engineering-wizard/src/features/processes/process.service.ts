@@ -5,11 +5,24 @@ import {
   UploadDataContentTypeEnum,
   UploadDataNextVersionTypeEnum,
   ResponseError,
+  FetchError,
 } from '@oscd-transnet-plugins/api-compas-custom-resource';
+import {
+  BackendTimeoutError, BackendTransportError, BackendHtmlResponseError,
+} from '../../utils/fetch-with-timeout';
 
 export type { UploadDataNextVersionTypeEnum };
 
 export type { VersionBump } from '@oscd-transnet-plugins/shared';
+
+export function isBackendUnavailable(error: unknown): boolean {
+  if (error instanceof FetchError) return isBackendUnavailable(error.cause);
+  return error instanceof BackendTransportError ||
+    error instanceof BackendTimeoutError ||
+    error instanceof ProcessEndpointUnavailableError ||
+    (error instanceof ResponseError &&
+      (error.response.status === 408 || error.response.status >= 500));
+}
 
 function toStoredProcess(process: Process, version: string): Process {
   return {
@@ -50,21 +63,48 @@ export class ProcessVersionConflictError extends Error {
   }
 }
 
+export class ProcessEndpointUnavailableError extends Error {
+  constructor(public readonly cause: ResponseError | BackendHtmlResponseError) {
+    super(cause instanceof ResponseError
+      ? 'The process API endpoint is not available (HTTP 404).'
+      : 'The process API endpoint returned HTML instead of an API response.');
+    this.name = 'ProcessEndpointUnavailableError';
+  }
+}
+
+function htmlResponseError(error: unknown): BackendHtmlResponseError | undefined {
+  if (error instanceof FetchError) return htmlResponseError(error.cause);
+  return error instanceof BackendHtmlResponseError ? error : undefined;
+}
+
 export class ProcessService {
   static readonly RESOURCE_TYPE = 'engineering-wizard_process';
   static readonly DATA_COMPATIBILITY_VERSION = '1.0.0';
 
   constructor(private readonly svc: CustomResourceService) {}
 
+  async readPersisted(entries: readonly RemoteProcessEntry[]): Promise<Process[]> {
+    return Promise.all(entries.map(async (entry) => {
+      const process = await this.getById(entry.resourceId);
+      if (process.id !== entry.processId) {
+        throw new Error(`Stored process ID does not match resource "${entry.resourceId}".`);
+      }
+      return { ...process, version: entry.version };
+    }));
+  }
+
   async listLatest(): Promise<RemoteProcessEntry[]> {
     const entries = await this.svc.getLatestByType(ProcessService.RESOURCE_TYPE).catch(async (error: unknown) => {
+      const htmlError = htmlResponseError(error);
+      if (htmlError) throw new ProcessEndpointUnavailableError(htmlError);
       if (!(error instanceof ResponseError) || error.response.status !== 404) throw error;
 
       let body: unknown;
       try {
         body = await error.response.clone().json();
-      } catch {
-        throw error;
+      } catch (parseError) {
+        if (!(parseError instanceof SyntaxError)) throw parseError;
+        throw new ProcessEndpointUnavailableError(error);
       }
       if (
         typeof body === 'object' && body !== null &&
@@ -76,7 +116,10 @@ export class ProcessService {
         )
       ) return [];
 
-      throw error;
+      if (typeof body === 'object' && body !== null && 'errorMessages' in body) {
+        throw error;
+      }
+      throw new ProcessEndpointUnavailableError(error);
     });
 
     return entries.map((entry) => ({
@@ -128,6 +171,11 @@ export class ProcessService {
       version: versionBump ? undefined : newVersion,
       nextVersionType: versionBump ?? undefined,
     }).catch((error: unknown) => {
+      const htmlError = htmlResponseError(error);
+      if (htmlError) throw new ProcessEndpointUnavailableError(htmlError);
+      if (error instanceof ResponseError && error.response.status === 404) {
+        throw new ProcessEndpointUnavailableError(error);
+      }
       if (error instanceof ResponseError && error.response.status === 409) {
         throw new ProcessVersionConflictError(process.id, newVersion);
       }

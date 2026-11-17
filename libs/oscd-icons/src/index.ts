@@ -5,6 +5,7 @@ export { default as OscdUploadIcon } from './oscd-upload-icon/OscdUploadIcon.sve
 export { default as OscdFindInPageIcon } from './oscd-find-in-page-icon/OscdFindInPageIcon.svelte';
 export { default as OscdInventory2Icon } from './oscd-inventory-2-icon/OscdInventory2Icon.svelte';
 export { default as OscdRefreshIcon } from './oscd-refresh-icon/OscdRefreshIcon.svelte';
+export { default as OscdSyncIcon } from './oscd-sync-icon/OscdSyncIcon.svelte';
 export { default as OscdSaveIcon } from './oscd-save-icon/OscdSaveIcon.svelte';
 export { default as OscdSearchIcon } from './oscd-search-icon/OscdSearchIcon.svelte';
 export { default as OscdRemoveIcon } from './oscd-remove-icon/OscdRemoveIcon.svelte';

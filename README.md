@@ -46,6 +46,38 @@ For integration, point CoMPAS at the preview URL printed in the terminal.
 Preview is a local integration server, not a production deployment: changes must
 be built and released to update distributions pinned to older plugin URLs/hashes.
 
+## Engineering Wizard process persistence
+
+The built-in process stays usable without a backend. Transport failures and
+five-second timeouts (including response-body downloads) allow saves in this
+browser. Missing list/upload API endpoints (HTTP 404 or frontend HTML fallback)
+also allow local saves; caller cancellation, malformed successful responses and
+missing individual resources do not. Structured backend lookup errors remain errors. The backend's
+`SDS-0006` empty-list response is treated as an empty list.
+
+Local snapshots retain the storage key `engineering-wizard.local-processes` and
+the version-1 process export format. They are pending changes, not a cache of all
+backend processes. Export them before clearing browser storage.
+
+Local persistence is not coordinated across browser tabs. Editing or syncing
+processes in multiple tabs at the same time can overwrite local changes; use
+one tab for process changes and export important pending work.
+
+**Sync** uploads the saved local snapshot, never unsaved editor changes. Equal,
+identical backend versions are accepted without another upload; conflicting
+versions keep the local copy and require a higher version before retrying.
+Concurrent Sync callers share one operation. Deleting a syncing process is
+blocked; edits saved during Sync remain local and still need syncing. Deleting a
+local copy does not delete backend versions.
+
+Both new and existing processes use separate editor drafts. Refresh cannot
+replace a draft, and Discard never writes an old snapshot back into the list.
+Only successful saves publish edits. Repository load warnings are presented by
+the UI; saves return their version and destination explicitly. An unavailable
+import lookup keeps that import local even if another request reconnects.
+Unreadable local storage is reported without hiding valid backend processes or
+overwriting known local snapshots.
+
 ## Engineering Wizard validation
 
 The wizard uses the legacy Validation Service endpoint **`POST /api/v1/validate`**

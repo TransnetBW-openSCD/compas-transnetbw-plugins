@@ -1,185 +1,270 @@
-import { compareVersions, type Process } from '@oscd-transnet-plugins/shared';
-import { v5 as uuidv5 } from 'uuid';
+import { bumpVersion, type Process } from '@oscd-transnet-plugins/shared';
 import { toastService } from '@oscd-transnet-plugins/oscd-services/toast';
-import { PROCESSES_SOURCE_URL } from './config';
-import {
-  engineeringProcesses,
-  engineeringProcessesStatus,
-} from './stores.svelte';
+import { DEFAULT_PROCESSES_XML } from './config';
+import { engineeringProcesses, engineeringProcessesStatus } from './stores.svelte';
 import { parseProcessesXml, parseXmlString } from './xml-parser';
 import { processService } from '../../bootstrap';
-import type { RemoteProcessEntry, VersionBump } from './process.service';
-import { updateProcessMetadata, removeProcess } from './mutations.svelte';
+import { isBackendUnavailable, type VersionBump } from './process.service';
+import { readLocalProcesses, upsertLocalProcess, removeLocalProcess } from './local-processes';
+import { mergeProcesses, normalizeProcess, reconcileProcesses } from './process-reconciliation';
+import {
+  coordinateProcessWrite, coordinateProcessSync, isProcessSyncing, syncLocalProcess,
+} from './process-sync';
 
-const recentlySavedProcesses = new Map<string, Process>();
-const LEGACY_VALIDATION_NAMESPACE = uuidv5('engineering-wizard/legacy-validation', uuidv5.URL);
+let recentlySavedProcesses = new Map<string, Process>();
+let loadGeneration = 0;
+// Subset lookups coordinate backend status, not full-list publication.
+let backendEpoch = 0;
+let pendingWrites = 0;
 
-function ensureProcessValidationIds(process: Process): void {
-  for (const group of process.pluginGroups) {
-    for (const plugin of group.plugins) {
-      plugin.validations?.forEach((validation, index) => {
-        // Legacy identities must survive reloads before the next explicit save.
-        validation.id ??= uuidv5(JSON.stringify([
-          process.id,
-          plugin.id,
-          index,
-          validation.title,
-          validation.description ?? '',
-          validation.context,
-          validation.assert,
-          validation.message ?? '',
-        ]), LEGACY_VALIDATION_NAMESPACE);
-      });
-    }
-  }
+export interface LoadWarning {
+  title: string;
+  message: string;
 }
 
-async function readPersistedProcesses(
-  entries: readonly RemoteProcessEntry[],
-): Promise<Process[]> {
-  return Promise.all(entries.map(async (entry) => {
-    const process = await processService.getById(entry.resourceId);
-    if (process.id !== entry.processId) {
-      throw new Error(`Stored process ID does not match resource "${entry.resourceId}".`);
-    }
-    // The resource metadata carries the authoritative version after a backend bump.
-    return { ...process, version: entry.version };
-  }));
+export interface LoadResult {
+  processes: Process[];
+  warnings: LoadWarning[];
 }
 
-function mergeById(primary: Process[], secondary: Process[]): Process[] {
-  const byId = new Map<string, Process>();
-  for (const p of primary) byId.set(p.id, p);
-  for (const p of secondary) byId.set(p.id, p);
-  return Array.from(byId.values());
+export type PersistedProcessesResult =
+  | { status: 'available'; processes: Map<string, Process> }
+  | { status: 'unavailable'; message: string };
+
+export interface SaveProcessResult {
+  version: string;
+  target: 'local' | 'backend';
 }
 
-function preserveRecentlySavedProcesses(processes: Process[]): Process[] {
-  const byId = new Map(processes.map((process) => [process.id, process]));
+const messageOf = (error: unknown) => error instanceof Error ? error.message : String(error);
 
-  for (const [processId, localProcess] of recentlySavedProcesses) {
-    const remoteProcess = byId.get(processId);
-    if (
-      !remoteProcess ||
-      compareVersions(localProcess.version, remoteProcess.version) > 0
-    ) {
-      byId.set(processId, localProcess);
-    } else {
-      recentlySavedProcesses.delete(processId);
-    }
-  }
-
-  return Array.from(byId.values());
+function setLocalIds(processes: readonly Process[]): void {
+  engineeringProcessesStatus.localProcessIds = processes.map(({ id }) => id);
 }
 
-async function loadEngineeringProcessesFromSources(
-  allowBackendFallback: boolean,
-): Promise<Process[]> {
-  engineeringProcessesStatus.loading = true;
-  engineeringProcessesStatus.error = '';
+export function isProcessLocal(id: string): boolean {
+  return engineeringProcessesStatus.localProcessIds.includes(id);
+}
 
+// Only availability failures describe the backend. Operation failures (conflicts,
+// validation, malformed data) are reported to their caller and leave status alone.
+function recordBackendFailure(error: unknown): void {
+  if (!isBackendUnavailable(error)) return;
+  engineeringProcessesStatus.backend = 'unavailable';
+  engineeringProcessesStatus.backendError = messageOf(error);
+}
+
+// Corrupt local storage must not block backend operations. Callers that need to
+// write locally still fail loudly, so unreadable data is never overwritten.
+function tryReadLocalProcesses(): Process[] | undefined {
   try {
-    // 1. Load the static baseline XML shipped with the plugin.
-    const res = await fetch(PROCESSES_SOURCE_URL, { cache: 'no-cache' });
-    if (!res.ok) {
-      throw new Error(
-        `HTTP ${res.status}${res.statusText ? `: ${res.statusText}` : ''}`,
-      );
-    }
-
-    const xmlText = await res.text();
-    const xml = parseXmlString(xmlText);
-    let processes = parseProcessesXml(xml);
-
-    // 2. Hydrate from backend — backend-saved processes win over the static baseline.
-    try {
-      const entries = await processService.listLatest();
-      if (entries.length > 0) {
-        const backendProcesses = await readPersistedProcesses(entries);
-        processes = mergeById(processes, backendProcesses);
-      }
-    } catch (error) {
-      if (!allowBackendFallback) throw error;
+    const local = readLocalProcesses();
+    setLocalIds(local);
+    engineeringProcessesStatus.localReadError = '';
+    return local;
+  } catch (error) {
+    const message = messageOf(error);
+    if (message !== engineeringProcessesStatus.localReadError) {
+      engineeringProcessesStatus.localReadError = message;
       toastService.warn(
-        'Saved processes could not be loaded',
-        `The XML baseline is being used. Saved processes may be missing or outdated. ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        'Local processes could not be read',
+        `Backend operations continue, but local-only processes are unavailable and were not modified. ${message}`,
         15_000,
       );
     }
-
-    processes = preserveRecentlySavedProcesses(processes);
-    processes.forEach(ensureProcessValidationIds);
-    engineeringProcesses.processes = processes;
-    return processes;
-  } catch (err) {
-    engineeringProcessesStatus.error =
-      err instanceof Error ? err.message : 'Failed to load processes.';
-    throw err;
-  } finally {
-    engineeringProcessesStatus.loading = false;
+    return undefined;
   }
 }
 
-export function loadEngineeringProcesses(): Promise<Process[]> {
-  return loadEngineeringProcessesFromSources(true);
+function recordBackendSuccess(): void {
+  engineeringProcessesStatus.backend = 'available';
+  engineeringProcessesStatus.backendError = '';
 }
 
-export function refreshEngineeringProcesses(): Promise<Process[]> {
-  return loadEngineeringProcessesFromSources(false);
+function publishSaved(process: Process): void {
+  ++loadGeneration;
+  ++backendEpoch;
+  engineeringProcessesStatus.loading = false;
+  recentlySavedProcesses.set(process.id, process);
+  engineeringProcesses.processes = mergeProcesses(engineeringProcesses.processes, [process]);
 }
 
-export async function getPersistedProcesses(
-  ids: ReadonlySet<string>,
-): Promise<Map<string, Process>> {
-  if (ids.size === 0) return new Map();
-  const entries = await processService.listLatest();
-  const processes = await readPersistedProcesses(
-    entries.filter(({ processId }) => ids.has(processId)),
-  );
-  return new Map(processes.map((process) => [process.id, process]));
-}
-
-export async function saveProcess(
-  process: Process,
-  versionBump?: VersionBump,
-): Promise<string> {
+async function trackWrite<T>(operation: () => Promise<T>): Promise<T> {
+  ++pendingWrites;
   engineeringProcessesStatus.saving = true;
   engineeringProcessesStatus.saveError = '';
-
   try {
-    ensureProcessValidationIds(process);
-    const processSnapshot = $state.snapshot(process) as Process;
-    const { version } = await processService.save(
-      processSnapshot,
-      versionBump,
-    );
-
-    updateProcessMetadata(process.id, { version });
-    recentlySavedProcesses.set(process.id, {
-      ...processSnapshot,
-      version,
-    });
-    return version;
-  } catch (err) {
-    engineeringProcessesStatus.saveError =
-      err instanceof Error ? err.message : 'Failed to save process.';
-    throw err;
+    return await operation();
+  } catch (error) {
+    engineeringProcessesStatus.saveError = messageOf(error);
+    throw error;
   } finally {
-    engineeringProcessesStatus.saving = false;
+    engineeringProcessesStatus.saving = --pendingWrites > 0;
   }
 }
 
-export async function deleteProcess(process: Process): Promise<void> {
-  engineeringProcessesStatus.saveError = '';
-
+async function loadEngineeringProcessesFromSources(): Promise<LoadResult> {
+  const current = ++loadGeneration;
+  const backendCurrent = ++backendEpoch;
+  const warnings: LoadWarning[] = [];
+  const result = (): LoadResult => ({
+    processes: engineeringProcesses.processes,
+    warnings: current === loadGeneration ? warnings : [],
+  });
+  engineeringProcessesStatus.loading = true;
+  engineeringProcessesStatus.error = '';
+  const readLocal = (): Process[] | undefined => {
+    try {
+      const local = readLocalProcesses();
+      setLocalIds(local);
+      return local;
+    } catch (error) {
+      const warning = { title: 'Local processes could not be loaded', message: messageOf(error) };
+      if (!warnings.some(({ title, message }) => title === warning.title && message === warning.message)) {
+        warnings.push(warning);
+      }
+      return undefined;
+    }
+  };
   try {
-    await processService.delete(process.id);
-    removeProcess(process.id);
-  } catch (err) {
-    engineeringProcessesStatus.saveError =
-      err instanceof Error ? err.message : 'Failed to delete process.';
-    throw err;
+    const baseline = parseProcessesXml(parseXmlString(DEFAULT_PROCESSES_XML));
+    let local = readLocal();
+    engineeringProcesses.processes = mergeProcesses(
+      baseline, engineeringProcesses.processes, Array.from(recentlySavedProcesses.values()), local ?? [],
+    ).map(normalizeProcess);
+    engineeringProcessesStatus.loading = false;
+
+    let remote: Process[];
+    try {
+      remote = await processService.readPersisted(await processService.listLatest());
+    } catch (error) {
+      if (current !== loadGeneration) return result();
+      if (backendCurrent === backendEpoch) recordBackendFailure(error);
+      warnings.push({
+        title: 'Backend processes could not be loaded',
+        message: `You can continue locally. Saved backend processes may be missing or outdated. ${messageOf(error)}`,
+      });
+      return result();
+    }
+    if (current !== loadGeneration) return result();
+    if (backendCurrent === backendEpoch) recordBackendSuccess();
+    // Preserve known local snapshots if storage fails, without hiding valid remote data.
+    local = readLocal() ?? local ?? engineeringProcesses.processes.filter(({ id }) => isProcessLocal(id));
+    const reconciled = reconcileProcesses(baseline, remote, recentlySavedProcesses, local);
+    recentlySavedProcesses = reconciled.pending;
+    engineeringProcesses.processes = reconciled.processes;
+    return result();
+  } catch (error) {
+    if (current === loadGeneration) engineeringProcessesStatus.error = messageOf(error);
+    throw error;
+  } finally {
+    if (current === loadGeneration) engineeringProcessesStatus.loading = false;
   }
+}
+
+export function loadEngineeringProcesses(): Promise<LoadResult> {
+  return loadEngineeringProcessesFromSources();
+}
+
+export function refreshEngineeringProcesses(): Promise<LoadResult> {
+  return loadEngineeringProcessesFromSources();
+}
+
+export async function getPersistedProcesses(ids: ReadonlySet<string>): Promise<PersistedProcessesResult> {
+  if (ids.size === 0) return { status: 'available', processes: new Map() };
+  const current = ++backendEpoch;
+  try {
+    const entries = await processService.listLatest();
+    const processes = await processService.readPersisted(entries.filter(({ processId }) => ids.has(processId)));
+    if (current === backendEpoch) recordBackendSuccess();
+    return { status: 'available', processes: new Map(processes.map((process) => [process.id, process])) };
+  } catch (error) {
+    if (!isBackendUnavailable(error)) throw error;
+    if (current === backendEpoch) recordBackendFailure(error);
+    return { status: 'unavailable', message: messageOf(error) };
+  }
+}
+
+export function saveProcess(
+  process: Process,
+  versionBump?: VersionBump,
+  options: { localOnly?: boolean } = {},
+): Promise<SaveProcessResult> {
+  const snapshot = normalizeProcess($state.snapshot(process) as Process);
+  return trackWrite(() => coordinateProcessWrite(snapshot.id, async () => {
+    // Durable state, rather than a view flag, decides whether edits stay local.
+    const local = tryReadLocalProcesses();
+    const isLocal = local ? local.some(({ id }) => id === snapshot.id) : isProcessLocal(snapshot.id);
+    const saveLocally = (): SaveProcessResult => {
+      const version = versionBump
+        ? bumpVersion(snapshot.version || '1.0.0', versionBump)
+        : snapshot.version || '1.0.0';
+      const saved = { ...snapshot, version };
+      setLocalIds(upsertLocalProcess(saved));
+      publishSaved(saved);
+      return { version, target: 'local' };
+    };
+    if (options.localOnly || engineeringProcessesStatus.backend === 'unavailable' ||
+      isLocal || isProcessSyncing(snapshot.id)) {
+      return saveLocally();
+    }
+    let version: string;
+    try {
+      ({ version } = await processService.save(snapshot, versionBump));
+    } catch (error) {
+      if (!isBackendUnavailable(error)) throw error;
+      recordBackendFailure(error);
+      return saveLocally();
+    }
+    recordBackendSuccess();
+    publishSaved({ ...snapshot, version });
+    return { version, target: 'backend' };
+  }));
+}
+
+export function syncProcess(process: Process): Promise<void> {
+  const id = process.id;
+  const alreadySyncing = isProcessSyncing(id);
+  // Mark synchronously so the UI disables sync/delete even while queued behind a write.
+  if (!alreadySyncing) {
+    engineeringProcessesStatus.syncingProcessIds = [...engineeringProcessesStatus.syncingProcessIds, id];
+  }
+  const result = coordinateProcessSync(id, () => trackWrite(async () => {
+    try {
+      const synced = await syncLocalProcess(id, processService);
+      setLocalIds(synced.localProcesses);
+      recordBackendSuccess();
+      // A save during upload wins over the uploaded snapshot.
+      const newer = synced.localProcesses.find((local) => local.id === id);
+      publishSaved(newer ?? normalizeProcess(synced.process));
+    } catch (error) {
+      recordBackendFailure(error);
+      throw error;
+    }
+  }));
+  if (!alreadySyncing) {
+    const unmark = () => {
+      engineeringProcessesStatus.syncingProcessIds =
+        engineeringProcessesStatus.syncingProcessIds.filter((other) => other !== id);
+    };
+    void result.then(unmark, unmark);
+  }
+  return result;
+}
+
+export function deleteProcess(process: Process): Promise<void> {
+  return trackWrite(() => coordinateProcessWrite(process.id, async () => {
+    const local = tryReadLocalProcesses();
+    const isLocal = local ? local.some(({ id }) => id === process.id) : isProcessLocal(process.id);
+    if (isLocal) {
+      setLocalIds(removeLocalProcess(process.id));
+    } else {
+      await processService.delete(process.id);
+    }
+    ++loadGeneration;
+    ++backendEpoch;
+    engineeringProcessesStatus.loading = false;
+    recentlySavedProcesses.delete(process.id);
+    engineeringProcesses.processes = engineeringProcesses.processes.filter(({ id }) => id !== process.id);
+  }, true));
 }

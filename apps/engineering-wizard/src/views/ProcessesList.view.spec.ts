@@ -12,7 +12,7 @@ import { openDialog } from '@oscd-transnet-plugins/oscd-services/dialog';
 import { toastService } from '@oscd-transnet-plugins/oscd-services/toast';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { tick } from 'svelte';
-import { deleteProcess, getPersistedProcesses, saveProcess } from '../features/processes/repository.svelte';
+import { deleteProcess, getPersistedProcesses, saveProcess, syncProcess } from '../features/processes/repository.svelte';
 import { ProcessVersionConflictError } from '../features/processes/process.service';
 import {
   engineeringProcesses,
@@ -22,11 +22,19 @@ import {
 } from '../features/processes/stores.svelte';
 import ProcessesList from './ProcessesList.view.svelte';
 import { createProcessExport } from '../features/processes/processJson';
+import { readLocalProcesses } from '../features/processes/local-processes';
+import { readFileSync } from 'node:fs';
+
+// Prevent Vite from rewriting this filesystem URL as a public asset.
+const moduleUrl = import.meta.url;
+const globalStyles = readFileSync(new URL('../../public/global.css', moduleUrl), 'utf8');
 
 vi.mock('../features/processes/repository.svelte', () => ({
   deleteProcess: vi.fn(),
   saveProcess: vi.fn(),
   getPersistedProcesses: vi.fn(),
+  syncProcess: vi.fn(),
+  isProcessLocal: (id: string) => engineeringProcessesStatus.localProcessIds.includes(id),
 }));
 vi.mock('@oscd-transnet-plugins/oscd-services/dialog', () => ({
   openDialog: vi.fn(),
@@ -35,11 +43,20 @@ vi.mock('@oscd-transnet-plugins/oscd-services/toast', () => ({
   toastService: { success: vi.fn(), error: vi.fn(), warn: vi.fn() },
 }));
 
+function publishSave(process: Process, version: string) {
+  const saved = { ...JSON.parse(JSON.stringify(process)) as Process, version };
+  engineeringProcesses.processes = [...engineeringProcesses.processes, saved];
+  return { version, target: 'backend' as const };
+}
+
 beforeEach(() => {
   vi.resetAllMocks();
   runningEngineeringProcess.process = null;
   engineeringProcessesStatus.loading = false;
   engineeringProcessesStatus.error = '';
+  engineeringProcessesStatus.backend = 'unknown';
+  engineeringProcessesStatus.localProcessIds = [];
+  localStorage.clear();
   vi.stubGlobal(
     'ResizeObserver',
     class {
@@ -55,11 +72,13 @@ beforeEach(() => {
     pluginGroups: [],
   }));
   vi.mocked(openDialog).mockResolvedValue({ type: 'confirm' });
-  vi.mocked(getPersistedProcesses).mockResolvedValue(new Map());
+  vi.mocked(getPersistedProcesses).mockResolvedValue({ status: 'available', processes: new Map() });
+  vi.mocked(saveProcess).mockImplementation(async (process) => publishSave(process, process.version));
 });
 
 afterEach(() => {
   cleanup();
+  document.getElementById('process-list-global-css')?.remove();
   selectedEngineeringProcess.process = null;
   vi.useRealTimers();
   vi.unstubAllGlobals();
@@ -117,7 +136,6 @@ it('recalculates the scrollable table height when host padding changes around a 
 });
 
 it('opens a saved duplicate when the user stays in the process list', async () => {
-  vi.mocked(saveProcess).mockResolvedValueOnce('1.0.0');
   const { getAllByRole, handleEdit, handleView } = renderList();
 
   await fireEvent.click(getAllByRole('button', { name: 'Duplicate process' })[0]);
@@ -130,11 +148,139 @@ it('opens a saved duplicate when the user stays in the process list', async () =
   expect(engineeringProcesses.processes).toHaveLength(4);
 });
 
+it('shows Sync only for local processes and retains local state when syncing fails', async () => {
+  const stylesheet = document.createElement('style');
+  stylesheet.id = 'process-list-global-css';
+  stylesheet.textContent = globalStyles;
+  document.head.appendChild(stylesheet);
+  engineeringProcessesStatus.localProcessIds = ['alpha'];
+  vi.mocked(syncProcess).mockRejectedValueOnce(new TypeError('Backend unavailable'));
+  const { getByRole, queryByRole, getByText, handleView } = renderList();
+  expect(getByText('Local only')).toBeTruthy();
+  expect(queryByRole('button', { name: 'Sync process Beta' })).toBeNull();
+  const syncButton = getByRole('button', { name: 'Sync process Alpha' });
+  expect(getComputedStyle(syncButton).marginBottom).toBe('0px');
+  expect(syncButton.querySelector('svg')).not.toBeNull();
+  expect(syncButton.querySelector('svg path')?.getAttribute('d')).not.toBe(
+    getByRole('button', { name: 'Export' }).querySelector('svg path')?.getAttribute('d'),
+  );
+  expect(syncButton.title).toBe('Sync to backend');
+  expect(syncButton.closest('td')?.textContent).toContain('Local only');
+  expect(syncButton.closest('.ew-table-actions')).toBeNull();
+  const localActions = syncButton.closest('tr')?.querySelector('.ew-table-actions');
+  const syncedActions = getByRole('checkbox', { name: 'Select process Beta' })
+    .closest('tr')?.querySelector('.ew-table-actions');
+  for (const actions of [localActions, syncedActions]) {
+    expect(Array.from(actions?.children ?? []).map((button) => button.getAttribute('aria-label')))
+      .toEqual(['Start process', 'Duplicate process', 'Delete process']);
+  }
+
+  await fireEvent.click(syncButton);
+
+  await waitFor(() => expect(toastService.error).toHaveBeenCalledWith(
+    'Sync failed', 'Backend unavailable Your local process was kept.',
+  ));
+  expect(handleView).not.toHaveBeenCalled();
+  expect(getByRole<HTMLButtonElement>('button', { name: 'Sync process Alpha' }).disabled).toBe(false);
+
+  vi.mocked(syncProcess).mockImplementationOnce(async () => {
+    engineeringProcessesStatus.localProcessIds = [];
+  });
+  await fireEvent.click(getByRole('button', { name: 'Sync process Alpha' }));
+  await waitFor(() => expect(queryByRole('button', { name: 'Sync process Alpha' })).toBeNull());
+  expect(toastService.success).toHaveBeenCalledWith(
+    'Process synced', '"Alpha" was saved to the backend.',
+  );
+});
+
+it('loads the built-in process and imports files locally when the backend is unreachable', async () => {
+  const repository = await vi.importActual<typeof import('../features/processes/repository.svelte')>(
+    '../features/processes/repository.svelte',
+  );
+  vi.mocked(getPersistedProcesses).mockImplementation(repository.getPersistedProcesses);
+  vi.mocked(saveProcess).mockImplementation(repository.saveProcess);
+  engineeringProcesses.processes = [];
+  vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')));
+  await repository.loadEngineeringProcesses();
+  const { getByRole, getByLabelText } = renderList();
+  expect(getByRole('checkbox', { name: 'Select process Standard Process 1' })).toBeTruthy();
+  expect(getByRole<HTMLButtonElement>('button', { name: 'Import' }).disabled).toBe(false);
+  const process: Process = {
+    id: 'offline-import', name: 'Offline import', description: '', version: '1.0.0', pluginGroups: [],
+  };
+  await fireEvent.change(getByLabelText('Import processes JSON files'), {
+    target: { files: [{
+      name: 'local.json', size: 100,
+      text: async () => JSON.stringify(createProcessExport([process])),
+    }] },
+  });
+  await waitFor(() => expect(toastService.success).toHaveBeenCalledWith(
+    'Process import complete', expect.stringContaining('1 saved locally in this browser. Use Sync'),
+  ));
+  expect(getByRole('button', { name: 'Sync process Offline import' })).toBeTruthy();
+  engineeringProcesses.processes = [];
+  await repository.loadEngineeringProcesses();
+  expect(engineeringProcesses.processes.some(({ id }) => id === 'offline-import')).toBe(true);
+});
+
+it('keeps an import local after its lookup fails even when a newer refresh reconnects', async () => {
+  const repository = await vi.importActual<typeof import('../features/processes/repository.svelte')>(
+    '../features/processes/repository.svelte',
+  );
+  vi.mocked(getPersistedProcesses).mockImplementationOnce(repository.getPersistedProcesses);
+  vi.mocked(saveProcess).mockImplementationOnce(repository.saveProcess);
+  let rejectLookup!: (reason: Error) => void;
+  const fetchBackend = vi.fn()
+    .mockImplementationOnce(() => new Promise<Response>((_resolve, reject) => { rejectLookup = reject; }))
+    .mockImplementation(async () => new Response('[]', {
+      headers: { 'Content-Type': 'application/json' },
+    }));
+  vi.stubGlobal('fetch', fetchBackend);
+  const { getByLabelText, getByRole } = renderList();
+  const process: Process = {
+    id: 'unverified-import', name: 'Unverified import', version: '1.0.0', description: '', pluginGroups: [],
+  };
+  await fireEvent.change(getByLabelText('Import processes JSON files'), {
+    target: { files: [{
+      name: 'processes.json', size: 100,
+      text: async () => JSON.stringify(createProcessExport([process])),
+    }] },
+  });
+  await waitFor(() => expect(fetchBackend).toHaveBeenCalledOnce());
+  await repository.refreshEngineeringProcesses();
+  expect(engineeringProcessesStatus.backend).toBe('available');
+  rejectLookup(new TypeError('Failed to fetch'));
+  await waitFor(() => expect(toastService.success).toHaveBeenCalledWith(
+    'Process import complete', expect.stringContaining('1 saved locally'),
+  ));
+  expect(saveProcess).toHaveBeenCalledWith(process, undefined, { localOnly: true });
+  expect(fetchBackend).toHaveBeenCalledTimes(2);
+  expect(readLocalProcesses()).toEqual([process]);
+  expect(getByRole('button', { name: 'Sync process Unverified import' })).toBeTruthy();
+  await repository.deleteProcess(process);
+});
+
+it('duplicates a process locally without a backend', async () => {
+  const repository = await vi.importActual<typeof import('../features/processes/repository.svelte')>(
+    '../features/processes/repository.svelte',
+  );
+  vi.mocked(saveProcess).mockImplementationOnce(repository.saveProcess);
+  engineeringProcessesStatus.backend = 'unavailable';
+  const { getAllByRole, getByRole, handleEdit } = renderList();
+  await fireEvent.click(getAllByRole('button', { name: 'Duplicate process' })[0]);
+  await waitFor(() => expect(handleEdit).toHaveBeenCalledWith(
+    expect.objectContaining({ id: 'alpha-copy' }),
+  ));
+  expect(getByRole('button', { name: 'Sync process Alpha (copy)' })).toBeTruthy();
+  expect(toastService.success).toHaveBeenCalledWith('Process duplicated', expect.stringContaining('locally'));
+});
+
 it('saves a pending duplicate without discarding a draft opened after leaving the list', async () => {
   let finishSave!: (version: string) => void;
-  vi.mocked(saveProcess).mockReturnValueOnce(new Promise((resolve) => {
-    finishSave = resolve;
-  }));
+  vi.mocked(saveProcess).mockImplementationOnce(async (process) => {
+    const version = await new Promise<string>((resolve) => { finishSave = resolve; });
+    return publishSave(process, version);
+  });
   const { getAllByRole, handleEdit, unmount } = renderList();
   handleEdit.mockImplementation((process: Process) => {
     selectedEngineeringProcess.process = process;
@@ -486,7 +632,7 @@ it('exports only selected visible processes', async () => {
 
 it('persists new processes, reports ID conflicts separately from save failures, and highlights only additions', async () => {
   vi.mocked(saveProcess)
-    .mockResolvedValueOnce('2.0.0')
+    .mockImplementationOnce(async (process) => publishSave(process, '2.0.0'))
     .mockRejectedValueOnce(new Error('Backend unavailable'));
   const { getByLabelText, container } = renderList();
   const input = getByLabelText('Import processes JSON files');
@@ -516,7 +662,7 @@ it('persists new processes, reports ID conflicts separately from save failures, 
 
 it('recognizes an identical backend-only process without uploading it', async () => {
   const process = { id: 'backend-only', name: 'Existing remote process', description: '', version: '9.0.0', pluginGroups: [] };
-  vi.mocked(getPersistedProcesses).mockResolvedValueOnce(new Map([[process.id, process]]));
+  vi.mocked(getPersistedProcesses).mockResolvedValueOnce({ status: 'available', processes: new Map([[process.id, process]]) });
   const { getByLabelText } = renderList();
   await fireEvent.change(getByLabelText('Import processes JSON files'), {
     target: { files: [{
@@ -588,7 +734,6 @@ it('does not save while backend verification is pending or failed and allows ret
   vi.mocked(getPersistedProcesses).mockReturnValueOnce(new Promise((_resolve, reject) => {
     rejectCheck = reject;
   }));
-  vi.mocked(saveProcess).mockResolvedValueOnce('1.0.0');
   const { getByLabelText, getByRole } = renderList();
   const process = { id: 'new', name: 'New process', description: '', version: '1.0.0', pluginGroups: [] };
   const event = { target: { files: [{
@@ -617,7 +762,6 @@ it('does not save while backend verification is pending or failed and allows ret
 });
 
 it('skips identical processes across files, preserves duplicate display names, and never saves conflicting versions', async () => {
-  vi.mocked(saveProcess).mockResolvedValue('1.0.0');
   const original = engineeringProcesses.processes[0];
   const incoming: Process = {
     id: 'new-alpha', name: 'Alpha', description: '', version: '1.0.0', pluginGroups: [],
@@ -651,7 +795,7 @@ it('reports a backend-only version conflict without saving or changing local sta
   const process: Process = {
     id: 'backend-only', name: 'Remote', description: '', version: '2.0.0', pluginGroups: [],
   };
-  vi.mocked(getPersistedProcesses).mockResolvedValueOnce(new Map([[process.id, process]]));
+  vi.mocked(getPersistedProcesses).mockResolvedValueOnce({ status: 'available', processes: new Map([[process.id, process]]) });
   const { getByLabelText } = renderList();
   await fireEvent.change(getByLabelText('Import processes JSON files'), {
     target: { files: [{
@@ -692,7 +836,6 @@ it('reports concurrent backend version conflicts separately from failed saves', 
 
 it('sorts rows without reordering stored processes and briefly highlights successful imports', async () => {
   engineeringProcesses.processes.reverse();
-  vi.mocked(saveProcess).mockResolvedValueOnce('1.0.0');
   const { getAllByRole, getByLabelText, getByRole } = renderList();
   expect(getAllByRole('checkbox').slice(1).map((checkbox) => checkbox.getAttribute('aria-label')))
     .toEqual(['Select process Alpha', 'Select process Beta', 'Select process Gamma']);
@@ -718,8 +861,8 @@ it('sorts rows without reordering stored processes and briefly highlights succes
 it('gives every process imported from multiple files its own uninterrupted highlight lifetime', async () => {
   const { getByLabelText, getByRole } = renderList();
   vi.useFakeTimers();
-  vi.mocked(saveProcess).mockImplementation(() =>
-    new Promise((resolve) => setTimeout(() => resolve('1.0.0'), 400)),
+  vi.mocked(saveProcess).mockImplementation((process) =>
+    new Promise((resolve) => setTimeout(() => resolve(publishSave(process, '1.0.0')), 400)),
   );
   const incoming: Process[] = ['A', 'B', 'C'].map((suffix) => ({
     id: `imported-${suffix}`,

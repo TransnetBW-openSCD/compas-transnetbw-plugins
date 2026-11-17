@@ -5,6 +5,7 @@ import {
   importProcessFiles,
   MAX_PROCESS_IMPORT_BYTES,
   parseProcessImportJson,
+  parseStoredProcessesJson,
 } from './processJson';
 
 const process: Process = {
@@ -56,6 +57,15 @@ describe('process JSON transfer', () => {
       expect(() => parseProcessImportJson(content)).toThrow('must use https');
     },
   );
+
+  it('accepts http plugin urls in stored snapshots but still rejects other schemes', () => {
+    const stored = (src: string) => JSON.stringify([{
+      ...process, pluginGroups: [{ title: 'G', plugins: [{ id: 'p', name: 'P', type: 'external', src }] }],
+    }]);
+    expect(parseStoredProcessesJson(stored('http://host/a.js'))[0].pluginGroups[0].plugins[0].src).toBe('http://host/a.js');
+    expect(() => parseStoredProcessesJson(stored('javascript:alert(1)'))).toThrow('must use https or http');
+    expect(() => parseStoredProcessesJson(stored('data:text/javascript,1'))).toThrow('must use https or http');
+  });
 
   it.each([
     ['invalid JSON', '{'],

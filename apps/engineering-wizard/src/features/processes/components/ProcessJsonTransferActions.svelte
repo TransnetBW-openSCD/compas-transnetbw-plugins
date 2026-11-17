@@ -5,7 +5,6 @@
   import { toastService } from '@oscd-transnet-plugins/oscd-services/toast';
   import { engineeringProcesses, engineeringProcessesStatus } from '../stores.svelte';
   import { getPersistedProcesses, saveProcess } from '../repository.svelte';
-  import { addProcess } from '../mutations.svelte';
   import { downloadProcessExport, importProcessFiles } from '../processJson';
   import { classifyProcessImport } from '../processImport';
   import { ProcessVersionConflictError } from '../process.service';
@@ -33,10 +32,19 @@
     importing = true;
     try {
       const { processes, failures } = await importProcessFiles(files);
-      const persisted = await getPersistedProcesses(
+      const lookup = await getPersistedProcesses(
         new Set(processes.map(({ id }) => id)),
       );
+      const persisted = lookup.status === 'available' ? lookup.processes : new Map<string, Process>();
+      if (lookup.status === 'unavailable') {
+        toastService.warn(
+          'Backend processes could not be verified',
+          `Imports will be saved locally. Backend conflicts will be checked when syncing. ${lookup.message}`,
+          15_000,
+        );
+      }
       let imported = 0;
+      let importedLocally = 0;
       let alreadyPresent = 0;
       const conflicts: { name: string; reason: string }[] = [];
       for (const process of processes) {
@@ -56,11 +64,13 @@
             });
             continue;
           }
-          const version = await saveProcess(process);
+          const { version, target } = lookup.status === 'unavailable'
+            ? await saveProcess(process, undefined, { localOnly: true })
+            : await saveProcess(process);
           const saved = { ...process, version };
           persisted.set(process.id, saved);
-          addProcess(saved);
           imported++;
+          if (target === 'local') importedLocally++;
         } catch (error) {
           const issue = {
             name: `${process.name} (ID "${process.id}")`,
@@ -70,7 +80,7 @@
           else failures.push(issue);
         }
       }
-      const summary = `${imported} imported; ${alreadyPresent} already present; ${conflicts.length} conflicting; ${failures.length} failed.`;
+      const summary = `${imported} imported; ${alreadyPresent} already present; ${conflicts.length} conflicting; ${failures.length} failed.${importedLocally ? ` ${importedLocally} saved locally in this browser. Use Sync to save them to the backend.` : ''}`;
       if (conflicts.length || failures.length) {
         const detail = [
           summary,
@@ -101,7 +111,7 @@
       class="ew-table-action ew-table-action--labeled"
       style="--mdc-theme-primary: var(--oscd-plugin-surface); --mdc-theme-on-primary: var(--oscd-plugin-brand); border: 0;"
       onclick={() => fileInput?.click()}
-      disabled={importing || engineeringProcessesStatus.loading || !!engineeringProcessesStatus.error}
+      disabled={importing || engineeringProcessesStatus.loading}
     >
       <Icon><OscdDownloadIcon svgStyles="fill: currentColor; width: 20px; height: 20px;" /></Icon>
       <Label>Import</Label>
