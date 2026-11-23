@@ -59,10 +59,10 @@ jobs:
         id: preflight
         run: |
           set -euo pipefail
-          case "$PLUGIN_NAME" in
-            archive-explorer|engineering-wizard|history-viewer|location-manager|location-viewer|template-generator|tsld) ;;
-            *) echo "Unsupported plugin: $PLUGIN_NAME" >&2; exit 1 ;;
-          esac
+          if ! [[ "$PLUGIN_NAME" =~ ^[a-z0-9-]+$ ]]; then
+            echo "Unsupported plugin: $PLUGIN_NAME" >&2
+            exit 1
+          fi
           case "$RELEASE_TYPE" in
             MAJOR|MINOR|PATCH) ;;
             *) echo "Unsupported release type: $RELEASE_TYPE" >&2; exit 1 ;;
