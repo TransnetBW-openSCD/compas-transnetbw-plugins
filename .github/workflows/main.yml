@@ -39,6 +39,9 @@ jobs:
       - name: Run Tests
         run: npm run test:all
 
+      - name: Test Plugin Release Workflow
+        run: node --test tools/plugin-release.test.mjs
+
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -67,21 +70,37 @@ jobs:
           path: dist
 
       - name: Copy Built Files to Plugins Folder
+        id: copy_build
         run: |
+          set -euo pipefail
           mkdir -p compas/plugins
           cp -r dist/apps/* compas/plugins
 
       - name: Commit and Push Changes
+        id: deploy_snapshot
         run: |
+          set -euo pipefail
+          if ! [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "SOURCE_SHA must be the full main build commit SHA." >&2
+            exit 1
+          fi
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
-          git add compas/plugins
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
+          git add -- compas/plugins
+          if git diff --cached --quiet -- compas/plugins ':(exclude)compas/plugins/SNAPSHOT_SHA'; then
+            echo "Build output unchanged. SNAPSHOT_SHA left as-is."
           else
-            git commit -m "Deploy latest build to plugins"
-            git push origin published-plugins
+            status=$?
+            if [ "$status" -ne 1 ]; then
+              exit "$status"
+            fi
+            printf '%s\n' "$SOURCE_SHA" > compas/plugins/SNAPSHOT_SHA
+            git add -- compas/plugins
+            git commit -m "Deploy latest build to plugins" -- compas/plugins
+            git push origin HEAD:refs/heads/published-plugins
           fi
+        env:
+          SOURCE_SHA: ${{ github.sha }}
 
   deploy-pages:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

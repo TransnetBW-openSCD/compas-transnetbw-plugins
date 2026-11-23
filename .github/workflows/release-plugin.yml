@@ -34,145 +34,211 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: write
-    
+
     steps:
       - name: Checkout published-plugins branch
         uses: actions/checkout@v4
         with:
           ref: published-plugins
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Fetch main and tags
+        id: fetch_refs
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git fetch origin 'refs/tags/*:refs/tags/*'
+
+      - name: Check that a new release can be published
+        id: preflight
+        run: |
+          set -euo pipefail
+          case "$PLUGIN_NAME" in
+            archive-explorer|engineering-wizard|history-viewer|location-manager|location-viewer|template-generator|tsld) ;;
+            *) echo "Unsupported plugin: $PLUGIN_NAME" >&2; exit 1 ;;
+          esac
+          case "$RELEASE_TYPE" in
+            MAJOR|MINOR|PATCH) ;;
+            *) echo "Unsupported release type: $RELEASE_TYPE" >&2; exit 1 ;;
+          esac
+
+          sha_file="compas/plugins/SNAPSHOT_SHA"
+          if [ ! -f "$sha_file" ]; then
+            echo "compas/plugins/SNAPSHOT_SHA is missing. Nothing is published." >&2
+            exit 1
+          fi
+          snapshot_sha=$(tr -d '[:space:]' < "$sha_file")
+          if ! [[ "$snapshot_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "compas/plugins/SNAPSHOT_SHA is not a commit SHA. Nothing is published." >&2
+            exit 1
+          fi
+          if ! git cat-file -e "${snapshot_sha}^{commit}"; then
+            echo "SNAPSHOT_SHA ${snapshot_sha} is not a commit. Nothing is published." >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$snapshot_sha" origin/main; then
+            echo "SNAPSHOT_SHA ${snapshot_sha} is not on main. Nothing is published." >&2
+            exit 1
+          fi
+
+          snapshot="compas/plugins/${PLUGIN_NAME}/index.js"
+          if [ ! -f "$snapshot" ]; then
+            echo "Snapshot index.js is missing at ${snapshot}. Nothing is published." >&2
+            exit 1
+          fi
+          tags=$(git tag --points-at "$snapshot_sha")
+          while IFS= read -r tag; do
+            if [[ "$tag" =~ ^${PLUGIN_NAME}-[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "${PLUGIN_NAME} is already tagged on ${snapshot_sha}: ${tag}. Nothing is published." >&2
+              exit 1
+            fi
+          done <<< "$tags"
+
+          for dir in "compas/plugins/${PLUGIN_NAME}"/*/; do
+            [ -d "$dir" ] || continue
+            version=$(basename "$dir")
+            if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && [ -f "${dir}index.js" ]; then
+              if cmp -s "$snapshot" "${dir}index.js"; then
+                echo "Snapshot index.js is already released as ${PLUGIN_NAME}/${version}. Nothing is published." >&2
+                exit 1
+              else
+                status=$?
+                if [ "$status" -ne 1 ]; then
+                  echo "Cannot compare snapshot with ${dir}index.js." >&2
+                  exit "$status"
+                fi
+              fi
+            fi
+          done
+
+          echo "SNAPSHOT_SHA=${snapshot_sha}" >> "$GITHUB_OUTPUT"
+        env:
+          PLUGIN_NAME: ${{ inputs.PLUGIN_NAME_TO_RELEASE }}
+          RELEASE_TYPE: ${{ inputs.RELEASE_TYPE }}
 
       - name: Find last release version
         id: find_last_version
         run: |
-          #!/bin/bash
-          set -e
-          
-          PLUGIN_NAME="${{ github.event.inputs.PLUGIN_NAME_TO_RELEASE }}"
-          PLUGIN_DIR="compas/plugins/$PLUGIN_NAME"
-          
-          echo "Searching for semver directories in: $PLUGIN_DIR"
-          
-          # Array to store found versions
+          set -euo pipefail
           versions=()
-          
-          # Check if plugin directory exists
-          if [ -d "$PLUGIN_DIR" ]; then
-            # Find all directories and check if they match semver pattern
-            for dir in "$PLUGIN_DIR"/*/ ; do
-              [ -d "$dir" ] || continue
-              dirname=$(basename "$dir")
-              
-              # Check if directory name matches semver pattern (X.Y.Z)
-              if [[ $dirname =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-                echo "Found semver directory: $dirname"
-                versions+=("$dirname")
-              fi
-            done
+          for dir in "compas/plugins/${PLUGIN_NAME}"/*/; do
+            [ -d "$dir" ] || continue
+            version=$(basename "$dir")
+            if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              versions+=("$version")
+            fi
+          done
+          if [ "${#versions[@]}" -eq 0 ]; then
+            last_version="0.0.0"
           else
-            echo "Plugin directory $PLUGIN_DIR not found"
+            last_version=$(printf '%s\n' "${versions[@]}" | sort -V | tail -n 1)
           fi
-          
-          # Determine the latest version
-          if [ ${#versions[@]} -eq 0 ]; then
-            LAST_RELEASE_VERSION="0.0.0"
-            echo "No semver directories found. Using default version: $LAST_RELEASE_VERSION"
-          else
-            # Sort versions semantically and get the latest
-            LAST_RELEASE_VERSION=$(printf '%s\n' "${versions[@]}" | sort -V | tail -n 1)
-            echo "Found ${#versions[@]} semver directories"
-            echo "Latest version: $LAST_RELEASE_VERSION"
-          fi
-          
-          echo "LAST_RELEASE_VERSION=$LAST_RELEASE_VERSION" >> $GITHUB_OUTPUT
+          echo "LAST_RELEASE_VERSION=${last_version}" >> "$GITHUB_OUTPUT"
+        env:
+          PLUGIN_NAME: ${{ inputs.PLUGIN_NAME_TO_RELEASE }}
 
       - name: Calculate new version
         id: calculate_new_version
         run: |
-          #!/bin/bash
-          set -e
-
-          PLUGIN_NAME="${{ github.event.inputs.PLUGIN_NAME_TO_RELEASE }}"
-          RELEASE_TYPE="${{ github.event.inputs.RELEASE_TYPE }}"
-          LAST_VERSION="${{ steps.find_last_version.outputs.LAST_RELEASE_VERSION }}"
-
-          echo "Plugin to release: $PLUGIN_NAME"
-          echo "Release type: $RELEASE_TYPE"
-          echo "Last published version: $LAST_VERSION"
-          
-          # Parse semantic version (MAJOR.MINOR.PATCH)
-          if [[ $LAST_VERSION =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-            MAJOR="${BASH_REMATCH[1]}"
-            MINOR="${BASH_REMATCH[2]}"
-            PATCH="${BASH_REMATCH[3]}"
-          else
-            echo "Invalid version format: $LAST_VERSION, using 0.0.0"
-            MAJOR=0
-            MINOR=0
-            PATCH=0
+          set -euo pipefail
+          if ! [[ "$LAST_VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "Invalid version format: $LAST_VERSION. Nothing is published." >&2
+            exit 1
           fi
-          
-          # Calculate new version based on RELEASE_TYPE
+
+          parse_component() {
+            local digits="${1#"${1%%[!0]*}"}"
+            digits="${digits:-0}"
+            local value=$((10#$digits))
+            if [[ "$value" != "$digits" ]]; then
+              echo "Version component exceeds Bash integer range: $digits." >&2
+              return 1
+            fi
+            printf '%s\n' "$value"
+          }
+          MAJOR=$(parse_component "${BASH_REMATCH[1]}")
+          MINOR=$(parse_component "${BASH_REMATCH[2]}")
+          PATCH=$(parse_component "${BASH_REMATCH[3]}")
+
           case "$RELEASE_TYPE" in
-            MAJOR)
-              MAJOR=$((MAJOR + 1))
-              MINOR=0
-              PATCH=0
-              ;;
-            MINOR)
-              MINOR=$((MINOR + 1))
-              PATCH=0
-              ;;
-            PATCH)
-              PATCH=$((PATCH + 1))
-              ;;
-            *)
-              echo "Invalid RELEASE_TYPE: $RELEASE_TYPE, using MINOR"
-              MINOR=$((MINOR + 1))
-              PATCH=0
-              ;;
+            MAJOR) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            MINOR) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            PATCH) PATCH=$((PATCH + 1)) ;;
+            *) echo "Unsupported release type: $RELEASE_TYPE" >&2; exit 1 ;;
           esac
-          
-          NEW_VERSION="$MAJOR.$MINOR.$PATCH"
-          echo "New version: $NEW_VERSION"
-          
-          # Export variables for next steps
-          echo "NEW_RELEASE_VERSION=$NEW_VERSION" >> $GITHUB_OUTPUT
-
-      - name: Release plugin
-        id: release_plugin
-        run: |
-          #!/bin/bash
-          set -e
-
-          PLUGIN_NAME="${{ github.event.inputs.PLUGIN_NAME_TO_RELEASE }}"
-          NEW_RELEASE_VERSION="${{ steps.calculate_new_version.outputs.NEW_RELEASE_VERSION }}"
-
-          echo "Plugin to release: $PLUGIN_NAME"
-          echo "New version: $NEW_RELEASE_VERSION"
-
-          # Create new directory for the plugin version
-          NEW_PLUGIN_DIR="compas/plugins/$PLUGIN_NAME/$NEW_RELEASE_VERSION"
-          mkdir -p "$NEW_PLUGIN_DIR"
-
-          # Copy built plugin files to the new version directory
-          cp -r "compas/plugins/$PLUGIN_NAME/index.js" "$NEW_PLUGIN_DIR/"
-          if [ -f "compas/plugins/$PLUGIN_NAME/style.css" ]; then
-            cp -r "compas/plugins/$PLUGIN_NAME/style.css" "$NEW_PLUGIN_DIR/"
+          new_version="${MAJOR}.${MINOR}.${PATCH}"
+          if ! [[ "$new_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Version increment exceeds Bash integer range. Nothing is published." >&2
+            exit 1
           fi
+          echo "NEW_RELEASE_VERSION=${new_version}" >> "$GITHUB_OUTPUT"
+          echo "RELEASE_TAG=${PLUGIN_NAME}-${new_version}" >> "$GITHUB_OUTPUT"
+        env:
+          PLUGIN_NAME: ${{ inputs.PLUGIN_NAME_TO_RELEASE }}
+          RELEASE_TYPE: ${{ inputs.RELEASE_TYPE }}
+          LAST_VERSION: ${{ steps.find_last_version.outputs.LAST_RELEASE_VERSION }}
 
-          echo "Plugin $PLUGIN_NAME version $NEW_RELEASE_VERSION released successfully"
-
-      - name: Commit and Push Changes
+      - name: Ensure tag name and version folder are free
+        id: ensure_available
         run: |
-          PLUGIN_NAME="${{ github.event.inputs.PLUGIN_NAME_TO_RELEASE }}"
-          NEW_RELEASE_VERSION="${{ steps.calculate_new_version.outputs.NEW_RELEASE_VERSION }}"
+          set -euo pipefail
+          existing_tag=$(git tag --list "$RELEASE_TAG")
+          if [ -n "$existing_tag" ]; then
+            echo "Tag ${RELEASE_TAG} already exists. Nothing is published." >&2
+            exit 1
+          fi
+          release_dir="compas/plugins/${PLUGIN_NAME}/${NEW_RELEASE_VERSION}"
+          if [ -e "$release_dir" ] || [ -L "$release_dir" ]; then
+            echo "Version path ${release_dir} already exists. Nothing is published." >&2
+            exit 1
+          fi
+          echo "Release ${RELEASE_TAG} at ${SNAPSHOT_SHA}"
+        env:
+          PLUGIN_NAME: ${{ inputs.PLUGIN_NAME_TO_RELEASE }}
+          NEW_RELEASE_VERSION: ${{ steps.calculate_new_version.outputs.NEW_RELEASE_VERSION }}
+          RELEASE_TAG: ${{ steps.calculate_new_version.outputs.RELEASE_TAG }}
+          SNAPSHOT_SHA: ${{ steps.preflight.outputs.SNAPSHOT_SHA }}
 
+      - name: Copy snapshot to the version folder
+        id: copy_plugin
+        run: |
+          set -euo pipefail
+          release_dir="compas/plugins/$PLUGIN_NAME/$NEW_RELEASE_VERSION"
+          mkdir "$release_dir"
+          cp "compas/plugins/$PLUGIN_NAME/index.js" "$release_dir/index.js"
+          if [ -f "compas/plugins/$PLUGIN_NAME/style.css" ]; then
+            cp "compas/plugins/$PLUGIN_NAME/style.css" "$release_dir/style.css"
+          fi
+        env:
+          PLUGIN_NAME: ${{ inputs.PLUGIN_NAME_TO_RELEASE }}
+          NEW_RELEASE_VERSION: ${{ steps.calculate_new_version.outputs.NEW_RELEASE_VERSION }}
+
+      - name: Commit and push the published version
+        id: publish_plugin
+        run: |
+          set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
-          git add "compas/plugins/$PLUGIN_NAME/$NEW_RELEASE_VERSION"
-          git status
-          git commit -m "Deploy $PLUGIN_NAME version $NEW_RELEASE_VERSION to published-plugins"
-          git push origin published-plugins
+          release_dir="compas/plugins/$PLUGIN_NAME/$NEW_RELEASE_VERSION"
+          git add -- "$release_dir"
+          git commit -m "Deploy $PLUGIN_NAME version $NEW_RELEASE_VERSION to published-plugins" -- "$release_dir"
+          git push origin HEAD:refs/heads/published-plugins
+        env:
+          PLUGIN_NAME: ${{ inputs.PLUGIN_NAME_TO_RELEASE }}
+          NEW_RELEASE_VERSION: ${{ steps.calculate_new_version.outputs.NEW_RELEASE_VERSION }}
+
+      - name: Tag the snapshot's main commit
+        id: tag_plugin
+        run: |
+          set -euo pipefail
+          git -c tag.gpgSign=false tag -a "$RELEASE_TAG" "$SNAPSHOT_SHA" -m "Release $PLUGIN_NAME $NEW_RELEASE_VERSION"
+          git push origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+        env:
+          PLUGIN_NAME: ${{ inputs.PLUGIN_NAME_TO_RELEASE }}
+          NEW_RELEASE_VERSION: ${{ steps.calculate_new_version.outputs.NEW_RELEASE_VERSION }}
+          RELEASE_TAG: ${{ steps.calculate_new_version.outputs.RELEASE_TAG }}
+          SNAPSHOT_SHA: ${{ steps.preflight.outputs.SNAPSHOT_SHA }}
 
   deploy-pages:
     needs: release
