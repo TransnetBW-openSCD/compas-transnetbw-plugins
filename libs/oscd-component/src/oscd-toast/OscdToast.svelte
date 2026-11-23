@@ -1,6 +1,6 @@
 <script lang="ts">
   import { Icon } from "@smui/common";
-  import { cubicIn, cubicOut } from "svelte/easing";
+  import { cubicIn } from "svelte/easing";
   import { fly } from "svelte/transition";
 
     interface Props {
@@ -38,7 +38,6 @@
     style="--color:{colors[type]}"
 
     in:fly={{ x: 0, y: 30, duration: 150, easing: cubicIn }}
-    out:fly={{ x: 50, y: 0, duration: 150, easing: cubicOut}}
 >
     <div class="icon">
         <Icon class="material-icons">{icons[type]}</Icon>
@@ -51,7 +50,7 @@
         {/if}
     </div>
 
-    <button class="close" onclick={close}>
+    <button type="button" class="close" aria-label="Close notification" onclick={close}>
         <Icon class="material-icons">close</Icon>
     </button>
 </div>

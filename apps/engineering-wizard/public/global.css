@@ -253,7 +253,8 @@ button:focus {
   gap: 4px;
 }
 
-.ew-table-actions .ew-table-action {
+.ew-table-actions .ew-table-action,
+.process-sync-button {
   box-sizing: border-box;
   display: inline-flex;
   align-items: center;
@@ -284,7 +285,8 @@ button:focus {
   color: var(--oscd-plugin-error);
 }
 
-.ew-table-actions .ew-table-action:hover:not(:disabled) {
+.ew-table-actions .ew-table-action:hover:not(:disabled),
+.process-sync-button:hover:not(:disabled) {
   background-color: var(--oscd-plugin-surface-muted);
 }
 
@@ -292,11 +294,13 @@ button:focus {
   background-color: var(--oscd-plugin-surface);
 }
 
-.ew-table-actions .ew-table-action:focus-visible {
+.ew-table-actions .ew-table-action:focus-visible,
+.process-sync-button:focus-visible {
   outline: 2px solid var(--oscd-plugin-brand);
   outline-offset: 2px;
 }
 
-.ew-table-actions .ew-table-action:disabled {
+.ew-table-actions .ew-table-action:disabled,
+.process-sync-button:disabled {
   cursor: default;
 }

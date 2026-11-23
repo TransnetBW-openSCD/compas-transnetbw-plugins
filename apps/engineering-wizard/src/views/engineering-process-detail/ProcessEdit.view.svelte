@@ -21,10 +21,10 @@
     from '../../features/plugins/validation/components/dialogs/AddNewValidationDialog.svelte';
   import ValidationJsonTransferActions
     from '../../features/plugins/validation/components/ValidationJsonTransferActions.svelte';
-  import { addProcess, addValidationToPluginInProcess, updateValidationInPluginInProcess, removeValidationFromPluginInProcess, updateProcessMetadata } from '../../features/processes/mutations.svelte';
+  import { addValidationToPluginInProcess, updateValidationInPluginInProcess, removeValidationFromPluginInProcess, updateProcessMetadata } from '../../features/processes/mutations.svelte';
   import { saveProcess } from '../../features/processes/repository.svelte';
   import { toastService } from '@oscd-transnet-plugins/oscd-services/toast';
-  import type { Plugin, Process, XPathValidation, VersionBump } from '@oscd-transnet-plugins/shared';
+  import type { Plugin, XPathValidation, VersionBump } from '@oscd-transnet-plugins/shared';
   import { compareValidationTitles, createValidation, createValidationCopyTitle } from '../../features/plugins/validation/validationRules';
   import { OscdConfirmDialog, OscdVersionBumpDialog, OscdDiscardChangesDialog } from '@oscd-transnet-plugins/oscd-component';
   import { onMount } from 'svelte';
@@ -94,6 +94,9 @@
   }
 
   onMount(() => {
+    if (selectedEngineeringProcess.mode === 'view' && selectedEngineeringProcess.process) {
+      selectedEngineeringProcess.beginEditing(selectedEngineeringProcess.process, creating ? 'new' : 'existing');
+    }
     const proc = selectedEngineeringProcess.process;
     entrySnapshot = proc ? JSON.stringify($state.snapshot(proc)) : null;
     return enterFullscreenView();
@@ -120,17 +123,6 @@
 
   let saving = $state(false);
 
-  function restoreSnapshot() {
-    if (creating || !entrySnapshot) return;
-    try {
-      const original = JSON.parse(entrySnapshot) as Process;
-      const idx = engineeringProcesses.processes.findIndex((p) => p.id === original.id);
-      if (idx !== -1) {
-        engineeringProcesses.processes[idx] = original;
-      }
-    } catch { /* ignore parse errors */ }
-  }
-
   function leaveEditMode() {
     engineeringProcessEditing.isEditing = false;
     selectedEngineeringProcess.process = null;
@@ -150,7 +142,6 @@
         message: 'You have unsaved changes. If you go back now, they will be lost.',
       });
       if (result?.type !== 'confirm') return;
-      restoreSnapshot();
     }
     returnToProcessList();
   }
@@ -193,13 +184,17 @@
           bump = versionResult.data as VersionBump;
         }
 
-        const version = await saveProcess(proc, bump);
-        if (creating) addProcess({ ...$state.snapshot(proc), version });
-        toastService.success('Process saved', `"${proc.name}" was saved to the database.`);
+        const { target } = await saveProcess(proc, bump);
+        toastService.success(
+          target === 'local' ? 'Process saved locally' : 'Process saved',
+          target === 'local'
+            ? `"${proc.name}" was saved in this browser. Use Sync to save it to the backend.`
+            : `"${proc.name}" was saved to the database.`,
+        );
       }
       returnToProcessList();
-    } catch {
-      toastService.error('Save failed', `"${proc.name}" could not be saved to the database.`);
+    } catch (error) {
+      toastService.error('Save failed', error instanceof Error ? error.message : String(error));
     } finally {
       saving = false;
     }

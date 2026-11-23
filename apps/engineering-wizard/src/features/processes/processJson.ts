@@ -19,7 +19,13 @@ function string(value: unknown, key: string, required = true): string {
   return value;
 }
 
-function url(value: unknown, key: string): string {
+// Imported files are untrusted and must use https. Stored snapshots were
+// already accepted once and may also use http URLs configured by the host.
+type UrlPolicy = readonly ('https:' | 'http:')[];
+const IMPORT_URL_POLICY: UrlPolicy = ['https:'];
+const STORED_URL_POLICY: UrlPolicy = ['https:', 'http:'];
+
+function url(value: unknown, key: string, allowed: UrlPolicy): string {
   const text = string(value, key, false);
   if (!text) return text;
   // Relative URLs resolve against the https base; any other scheme is rejected.
@@ -29,7 +35,9 @@ function url(value: unknown, key: string): string {
   } catch {
     throw new Error(`"${key}" must be a valid URL.`);
   }
-  if (protocol !== 'https:') throw new Error(`"${key}" must use https.`);
+  if (!allowed.includes(protocol as UrlPolicy[number])) {
+    throw new Error(`"${key}" must use ${allowed.map((p) => p.slice(0, -1)).join(' or ')}.`);
+  }
   return text;
 }
 
@@ -38,7 +46,7 @@ function array(value: unknown, key: string): unknown[] {
   return value;
 }
 
-function parsePlugin(value: unknown): Plugin {
+function parsePlugin(value: unknown, urlPolicy: UrlPolicy): Plugin {
   const plugin = record(value);
   if (plugin.type !== 'internal' && plugin.type !== 'external') {
     throw new Error('Plugin "type" must be "internal" or "external".');
@@ -52,7 +60,7 @@ function parsePlugin(value: unknown): Plugin {
     if (plugin[key] !== undefined) result[key] = string(plugin[key], key, false);
   }
   for (const key of ['src', 'sourceUrl'] as const) {
-    if (plugin[key] !== undefined) result[key] = url(plugin[key], key);
+    if (plugin[key] !== undefined) result[key] = url(plugin[key], key, urlPolicy);
   }
   if (plugin.validations !== undefined) {
     result.validations = parseValidationImport(array(plugin.validations, 'validations'));
@@ -60,7 +68,7 @@ function parsePlugin(value: unknown): Plugin {
   return result;
 }
 
-function parseProcess(value: unknown): Process {
+function parseProcess(value: unknown, urlPolicy: UrlPolicy): Process {
   const process = record(value);
   const pluginIds = new Set<string>();
   return {
@@ -73,7 +81,7 @@ function parseProcess(value: unknown): Process {
       return {
         title: string(group.title, 'title'),
         plugins: array(group.plugins, 'plugins').map((value) => {
-          const plugin = parsePlugin(value);
+          const plugin = parsePlugin(value, urlPolicy);
           if (pluginIds.has(plugin.id)) {
             throw new Error(`Duplicate plugin id "${plugin.id}".`);
           }
@@ -85,19 +93,27 @@ function parseProcess(value: unknown): Process {
   };
 }
 
-export function parseProcessImportJson(content: string): Process[] {
+function parseProcessJson(content: string, urlPolicy: UrlPolicy): Process[] {
   let value: unknown;
   try {
     value = JSON.parse(content);
   } catch {
     throw new Error('The selected file does not contain valid JSON.');
   }
-  if (Array.isArray(value)) return value.map(parseProcess);
+  if (Array.isArray(value)) return value.map((entry) => parseProcess(entry, urlPolicy));
   const exported = record(value);
   if (exported.formatVersion !== FORMAT_VERSION) {
     throw new Error(`Unsupported process export format version "${String(exported.formatVersion)}".`);
   }
-  return array(exported.processes, 'processes').map(parseProcess);
+  return array(exported.processes, 'processes').map((entry) => parseProcess(entry, urlPolicy));
+}
+
+export function parseProcessImportJson(content: string): Process[] {
+  return parseProcessJson(content, IMPORT_URL_POLICY);
+}
+
+export function parseStoredProcessesJson(content: string): Process[] {
+  return parseProcessJson(content, STORED_URL_POLICY);
 }
 
 function serializeProcess(process: Process): Process {

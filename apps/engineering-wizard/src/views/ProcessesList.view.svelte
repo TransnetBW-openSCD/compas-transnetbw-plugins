@@ -5,7 +5,7 @@
   import type { Process } from '@oscd-transnet-plugins/shared';
 
   import { OscdBasicDataTable, OscdConfirmDialog } from '@oscd-transnet-plugins/oscd-component';
-  import { OscdInfoIcon, OscdPlayCircleIcon, OscdArrowForwardIcon, OscdDeleteIcon, OscdControlPointDuplicateIcon } from '@oscd-transnet-plugins/oscd-icons';
+  import { OscdInfoIcon, OscdPlayCircleIcon, OscdArrowForwardIcon, OscdDeleteIcon, OscdControlPointDuplicateIcon, OscdSyncIcon } from '@oscd-transnet-plugins/oscd-icons';
   import { openDialog } from '@oscd-transnet-plugins/oscd-services/dialog';
   import { toastService } from '@oscd-transnet-plugins/oscd-services/toast';
 
@@ -16,8 +16,7 @@
     engineeringProcessesStatus,
     runningEngineeringProcess
   } from '../features/processes/stores.svelte';
-  import { addProcess } from '../features/processes/mutations.svelte';
-  import { deleteProcess, saveProcess } from '../features/processes/repository.svelte';
+  import { deleteProcess, isProcessLocal, saveProcess, syncProcess } from '../features/processes/repository.svelte';
 
   interface Props {
     handleStart: (process: Process) => void;
@@ -28,12 +27,13 @@
     docName?: string;
   }
 
-  type ProcessRow = Process & { displayName: string; validationCount: number };
+  type ProcessRow = Process & { displayName: string; validationCount: number; syncStatus: string };
 
   const { handleStart, handleView, handleEdit, handleAddNew, handleDeleted, docName }: Props = $props();
 
   let selectedRowIds = $state<(string | number)[]>([]);
   let deleting = $state(false);
+  const syncingProcessIds = $derived(engineeringProcessesStatus.syncingProcessIds);
   const processes = $derived(engineeringProcesses.processes ?? []);
   let highlightedRowIds = $state<string[]>([]);
   let previousIds: Set<string> | undefined;
@@ -62,15 +62,16 @@
   });
 
   async function handleDeleteClick(items: Process[]) {
-    if (deleting || items.length === 0) return;
+    if (deleting || items.length === 0 || items.some(({ id }) => syncingProcessIds.includes(id))) return;
     deleting = true;
     try {
       const single = items.length === 1;
+      const hasLocalProcesses = items.some(({ id }) => isProcessLocal(id));
       const result = await openDialog(OscdConfirmDialog, {
         title: single ? 'Delete process' : 'Delete processes',
         message: single
-          ? `Are you sure you want to delete the process "${items[0].name || items[0].id}"? This action cannot be undone.`
-          : `Are you sure you want to delete ${items.length} selected processes? This action cannot be undone.`,
+          ? `Are you sure you want to delete the process "${items[0].name || items[0].id}"? This action cannot be undone.${hasLocalProcesses ? ' Only the local copy will be deleted. Backend versions will not be changed.' : ''}`
+          : `Are you sure you want to delete ${items.length} selected processes? This action cannot be undone.${hasLocalProcesses ? ' For local processes, only the local copy will be deleted. Backend versions will not be changed.' : ''}`,
         confirmActionText: 'Delete',
         confirmActionColor: 'danger',
       });
@@ -126,14 +127,33 @@
         name = `${baseName} (copy ${n})`;
       }
       const draft: Process = { ...($state.snapshot(item) as Process), id, name, version: '1.0.0' };
-      const version = await saveProcess(draft);
-      const created = addProcess({ ...draft, version });
-      toastService.success('Process duplicated', `"${created.name}" was created.`);
+      const { version, target } = await saveProcess(draft);
+      const created = { ...draft, version };
+      toastService.success(
+        'Process duplicated',
+        `"${created.name}" was created${target === 'local' ? ' locally. Use Sync to save it to the backend' : ''}.`,
+      );
       if (active) handleEdit(created);
-    } catch {
-      toastService.error('Duplicate failed', `"${item.name || item.id}" could not be duplicated.`);
+    } catch (error) {
+      toastService.error('Duplicate failed', error instanceof Error ? error.message : String(error));
     } finally {
       duplicating = false;
+    }
+  }
+
+  async function handleSyncClick(item: Process) {
+    if (syncingProcessIds.includes(item.id)) return;
+    try {
+      await syncProcess(item);
+      toastService.success(
+        'Process synced',
+        `"${item.name || item.id}" was saved to the backend.${isProcessLocal(item.id) ? ' Newer local changes still need syncing.' : ''}`,
+      );
+    } catch (error) {
+      toastService.error(
+        'Sync failed',
+        `${error instanceof Error ? error.message : String(error)} Your local process was kept.`,
+      );
     }
   }
 
@@ -143,6 +163,7 @@
     processes.map((p) => ({
       ...p,
       displayName: p.name || p.id,
+      syncStatus: isProcessLocal(p.id) ? 'Local only' : '',
       validationCount: (p.pluginGroups ?? [])
         .flatMap((g) => g.plugins ?? [])
         .reduce((sum, plugin) => sum + (plugin.validations?.length ?? 0), 0),
@@ -164,6 +185,7 @@
     { key: 'displayName', header: 'Name', bold: true, width: 'min(22cqw, 252px)', tooltip: true },
     { key: 'description', header: 'Description', tooltip: true },
     { key: 'version', header: 'Version', width: '96px', tooltip: true },
+    { key: 'syncStatus', header: 'Sync status', width: '144px' },
     { key: 'validationCount', header: 'Validations', width: '112px' },
   ] as const;
 
@@ -257,7 +279,8 @@
         variant="raised"
         style="--mdc-theme-primary: var(--oscd-plugin-error); --mdc-theme-on-primary: white;"
         onclick={() => handleDeleteClick(visibleSelectedProcesses)}
-        disabled={deleting || visibleSelectedProcesses.length === 0}
+        disabled={deleting || visibleSelectedProcesses.length === 0 ||
+          visibleSelectedProcesses.some(({ id }) => syncingProcessIds.includes(id))}
       >
         <Icon><OscdDeleteIcon svgStyles="fill: currentColor; width: 18px; height: 18px;" /></Icon>
         <Label>Delete</Label>
@@ -271,6 +294,7 @@
     items={filteredRows}
     {highlightedRowIds}
     {columns}
+    cells={{ syncStatus: syncStatusCell }}
     tableLayout="fixed"
     actionsWidth="224px"
     loading={engineeringProcessesStatus.loading}
@@ -318,7 +342,7 @@
           class="ew-table-action ew-table-action--danger"
           aria-label="Delete process"
           title="Delete process"
-          disabled={deleting}
+          disabled={deleting || syncingProcessIds.includes(item.id)}
           onclick={(e) => { e.stopPropagation(); handleDeleteClick([item]); }}
         >
           <OscdDeleteIcon svgStyles="fill: currentColor; width: 20px; height: 20px;" />
@@ -328,7 +352,40 @@
   </OscdBasicDataTable>
 </div>
 
+{#snippet syncStatusCell({ item }: { item: ProcessRow })}
+  <div class="process-sync-status">
+    <span>{item.syncStatus}</span>
+    {#if isProcessLocal(item.id)}
+      <button
+        type="button"
+        class="process-sync-button"
+        aria-label={`Sync process ${item.name || item.id}`}
+        aria-busy={syncingProcessIds.includes(item.id)}
+        title={syncingProcessIds.includes(item.id) ? 'Syncing to backend…' : 'Sync to backend'}
+        disabled={syncingProcessIds.includes(item.id) || deleting}
+        onclick={(e) => { e.stopPropagation(); handleSyncClick(item); }}
+      >
+        <OscdSyncIcon svgStyles="fill: currentColor; width: 20px; height: 20px;" />
+      </button>
+    {/if}
+  </div>
+{/snippet}
+
 <style>
+  .process-sync-status {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 36px;
+    gap: 4px;
+  }
+
+  .process-sync-button :global(.oscd-icon) {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
   .processes {
     margin-top: 16px;
     padding: 0 24px;

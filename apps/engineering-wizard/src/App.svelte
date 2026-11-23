@@ -23,6 +23,12 @@
   import { resolveWorkflowPlugin } from './features/plugins/plugin-catalog';
   import { documentStore, updateDocumentStore } from './documentStore.svelte';
   import { validationCoordinator } from './services/validationCoordinator.svelte';
+  import { toastService } from '@oscd-transnet-plugins/oscd-services/toast';
+  import type { LoadResult } from './features/processes/repository.svelte';
+
+  function showLoadWarnings(result: LoadResult) {
+    for (const warning of result.warnings) toastService.warn(warning.title, warning.message, 15_000);
+  }
 
   interface Props {
     doc?: XMLDocument;
@@ -67,8 +73,10 @@
   }
 
   onMount(async () => {
+    const loading = loadEngineeringProcesses();
+    restoreWorkflowState(doc);
     try {
-      await loadEngineeringProcesses();
+      showLoadWarnings(await loading);
     } catch {
       // Status is already tracked in engineeringProcessesStatus.error
     }
@@ -144,13 +152,13 @@
   });
 
   function handleEdit(process: Process) {
+    selectedEngineeringProcess.beginEditing(process, 'existing');
     engineeringProcessEditing.isEditing = true;
-    selectedEngineeringProcess.process = process;
   }
 
   async function refreshProcesses() {
     try {
-      await refreshEngineeringProcesses();
+      showLoadWarnings(await refreshEngineeringProcesses());
       restoreWorkflowState(doc);
     } catch {
       // Status is already tracked in engineeringProcessesStatus.error
@@ -158,14 +166,13 @@
   }
 
   function addNewProcess() {
-    selectedEngineeringProcess.process = null;
-    selectedEngineeringProcess.draft = {
+    selectedEngineeringProcess.beginEditing({
       id: '',
       name: '',
       description: '',
       version: '1.0.0',
       pluginGroups: [{ title: 'Ungrouped', plugins: [] }],
-    };
+    }, 'new');
     engineeringProcessEditing.isEditing = true;
   }
 </script>
@@ -175,7 +182,7 @@
 <div class="app-root">
   {#if selectedEngineeringProcess.process && engineeringProcessEditing.isEditing}
     <ProcessEditView
-      creating={selectedEngineeringProcess.draft !== null}
+      creating={selectedEngineeringProcess.mode === 'new'}
       onReturnToList={refreshProcesses}
     />
   {:else}
