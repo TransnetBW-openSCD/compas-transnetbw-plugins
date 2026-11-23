@@ -289,6 +289,10 @@ test('unchanged build output leaves the snapshot SHA and publication commit unch
 test('changed build output records its main SHA without modifying older releases', (t) => {
   const repo = repository(t);
   repo.version('0.0.1');
+  writeFileSync(
+    join(repo.source, 'compas/plugins', plugin, 'snapshot', 'obsolete.txt'),
+    'stale\n',
+  );
   repo.publishFiles();
   repo.build('new plugin build\n');
   succeeded(repo.run('deploy'));
@@ -311,6 +315,12 @@ test('changed build output records its main SHA without modifying older releases
       `${publicationRef}:compas/plugins/${plugin}/0.0.1/index.js`,
     ),
     'old build 0.0.1',
+  );
+  assert.throws(() =>
+    repo.remoteGit(
+      'show',
+      `${publicationRef}:compas/plugins/${plugin}/snapshot/obsolete.txt`,
+    ),
   );
   assert.equal(repo.remoteGit('rev-parse', 'main'), repo.mainSha);
 });
