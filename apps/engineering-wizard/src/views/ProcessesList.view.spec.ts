@@ -660,6 +660,32 @@ it('persists new processes, reports ID conflicts separately from save failures, 
   expect((input as HTMLInputElement).value).toBe('');
 });
 
+it('saves file imports locally with a user-facing warning when shared storage cannot be checked', async () => {
+  const incoming = { id: 'local-import', name: 'Local import', description: '', version: '1.0.0', pluginGroups: [] };
+  vi.mocked(getPersistedProcesses).mockResolvedValue({ status: 'unavailable', message: 'Connection failed' });
+  vi.mocked(saveProcess).mockResolvedValue({ version: '1.0.0', target: 'local' });
+  const { getByLabelText } = renderList();
+  await fireEvent.change(getByLabelText('Import processes JSON files'), {
+    target: { files: [{
+      name: 'processes.json',
+      size: 100,
+      text: async () => JSON.stringify([incoming]),
+    }] },
+  });
+
+  await waitFor(() => expect(toastService.success).toHaveBeenCalled());
+  expect(toastService.warn).toHaveBeenCalledWith(
+    'Could not check previously saved processes',
+    'Imported processes will be saved in this browser. Conflicts with shared processes will be checked when you sync. Connection failed',
+    15_000,
+  );
+  expect(saveProcess).toHaveBeenCalledWith(incoming, undefined, { localOnly: true });
+  expect(toastService.success).toHaveBeenCalledWith(
+    'Process import complete',
+    expect.stringContaining('Use Sync to save them to shared storage.'),
+  );
+});
+
 it('recognizes an identical backend-only process without uploading it', async () => {
   const process = { id: 'backend-only', name: 'Existing remote process', description: '', version: '9.0.0', pluginGroups: [] };
   vi.mocked(getPersistedProcesses).mockResolvedValueOnce({ status: 'available', processes: new Map([[process.id, process]]) });

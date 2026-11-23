@@ -38,8 +38,8 @@
       const persisted = lookup.status === 'available' ? lookup.processes : new Map<string, Process>();
       if (lookup.status === 'unavailable') {
         toastService.warn(
-          'Backend processes could not be verified',
-          `Imports will be saved locally. Backend conflicts will be checked when syncing. ${lookup.message}`,
+          'Could not check previously saved processes',
+          `Imported processes will be saved in this browser. Conflicts with shared processes will be checked when you sync. ${lookup.message}`,
           15_000,
         );
       }
@@ -80,7 +80,7 @@
           else failures.push(issue);
         }
       }
-      const summary = `${imported} imported; ${alreadyPresent} already present; ${conflicts.length} conflicting; ${failures.length} failed.${importedLocally ? ` ${importedLocally} saved locally in this browser. Use Sync to save them to the backend.` : ''}`;
+      const summary = `${imported} imported; ${alreadyPresent} already present; ${conflicts.length} conflicting; ${failures.length} failed.${importedLocally ? ` ${importedLocally} saved locally in this browser. Use Sync to save them to shared storage.` : ''}`;
       if (conflicts.length || failures.length) {
         const detail = [
           summary,
