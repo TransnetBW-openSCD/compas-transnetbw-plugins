@@ -46,6 +46,62 @@ For integration, point CoMPAS at the preview URL printed in the terminal.
 Preview is a local integration server, not a production deployment: changes must
 be built and released to update distributions pinned to older plugin URLs/hashes.
 
+## Plugin release tags
+
+The GitHub deploy workflow records the main build commit in
+`compas/plugins/SNAPSHOT_SHA` on `published-plugins` only when the copied build
+output changes. An unchanged build leaves the existing snapshot SHA untouched.
+
+Each build is published under `compas/plugins/<plugin>/snapshot/`. Snapshot and
+version URLs have the same path depth, so relative `../` loads resolve the same
+way. Use `<plugin>/snapshot/index.js` for the current snapshot; any legacy flat
+`<plugin>/index.js` remains in place but is no longer updated.
+
+Run **Release Plugin** manually from `main`, selecting a plugin and a
+MAJOR/MINOR/PATCH increment. The release uses the existing published snapshot;
+it does not rebuild the plugin. Before publishing it checks that the snapshot
+SHA is a commit on main, that this plugin has no release tag on that SHA, that
+the snapshot `index.js` is not already in a version folder, and that the next
+version folder and tag are free. Versions are calculated independently from
+each plugin's existing version folders. Versions exceeding Bash's integer range
+stop the release rather than overflowing.
+
+The whole snapshot, including extra files and subdirectories, is copied into
+the version folder. Its `package.json` version is set to the release version;
+the snapshot manifest stays as built. CI includes the source plugin manifest
+when the build does not emit one. Missing or invalid snapshot manifests stop
+the release before publishing.
+
+The version folder is committed and pushed to `published-plugins` first.
+Only after that push succeeds is the annotated `<PLUGIN_NAME>-<VERSION>` tag
+created on `SNAPSHOT_SHA`, with message `Release <PLUGIN_NAME> <VERSION>` and
+tagger `github-actions[bot]`. There is no new commit on main. Different plugins
+may have different tags on the same main commit.
+
+Deploy and release retain the shared `plugin-publication` concurrency group.
+A normal, non-forced publication push also rejects conflicting parallel
+updates before tagging. A failed tag push is not repaired automatically:
+the published version folder remains and prevents releasing the same snapshot
+again. Inspect the failed workflow before reconciling the publication and tag.
+
+A missing `SNAPSHOT_SHA` fails closed. A changed build must be deployed with the
+updated workflow before snapshots published without a source marker can be
+released. Existing Pages publishing is unchanged.
+
+Snapshot checks, version calculation, copying, publication, and tagging are
+Bash steps directly in the YAML workflows, following the reference workflow,
+with inline Node.js commands to validate and update release metadata.
+Deploy and release each check out `published-plugins` once; there is no separate
+runtime script or tools checkout.
+
+Release and snapshot regression tests execute the actual YAML shell steps
+against temporary local Git repositories. They require the installed workspace
+dependencies:
+
+```sh
+node --test tools/plugin-release.test.mjs
+```
+
 ## Engineering Wizard validation
 
 The wizard uses the legacy Validation Service endpoint **`POST /api/v1/validate`**
