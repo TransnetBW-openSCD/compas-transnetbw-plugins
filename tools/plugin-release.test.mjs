@@ -31,6 +31,9 @@ const releaseWorkflow = YAML.parse(
   ),
 );
 const deploySteps = mainWorkflow.jobs.deploy.steps.filter((step) => step.run);
+const manifestSteps = mainWorkflow.jobs['build-and-test'].steps.filter(
+  (step) => step.id === 'include_manifests',
+);
 const releaseSteps = releaseWorkflow.jobs.release.steps.filter(
   (step) => step.run,
 );
@@ -173,14 +176,19 @@ function repository(t) {
   const mainSha = git('rev-parse', 'HEAD');
   git('switch', '--orphan', 'published-plugins');
   for (const name of [plugin, 'engineering-wizard']) {
-    mkdirSync(join(source, 'compas/plugins', name), { recursive: true });
-    writeFileSync(join(source, 'compas/plugins', name, 'index.js'), bundle);
+    const directory = join(source, 'compas/plugins', name, 'snapshot');
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(join(directory, 'index.js'), bundle);
+    writeFileSync(
+      join(directory, 'package.json'),
+      JSON.stringify({ name, version: '0.0.1' }) + '\n',
+    );
   }
   writeFileSync(
     join(source, 'compas/plugins/SNAPSHOT_SHA'),
     `${snapshotSha}\n`,
   );
-  writeFileSync(join(source, '.gitignore'), 'dist/\n');
+  writeFileSync(join(source, '.gitignore'), 'dist/\napps/\n');
   git('add', '.');
   git('commit', '-m', 'Published snapshot');
   gitAt(root, 'init', '--bare', '--initial-branch=main', remote);
@@ -202,6 +210,7 @@ function repository(t) {
   const run = (mode = 'prepare', overrides = {}, cwd = source) => {
     const config = options(overrides, cwd);
     if (mode === 'deploy') return runSteps(deploySteps, config);
+    if (mode === 'manifests') return runSteps(manifestSteps, config);
     if (mode === 'release') return runSteps(releaseSteps, config);
     if (mode === 'prepare') return runSteps(preflightSteps, config);
     throw new Error(`Unsupported test mode: ${mode}`);
@@ -225,6 +234,10 @@ function repository(t) {
       writeFileSync(
         join(directory, 'index.js'),
         name === plugin ? contents : bundle,
+      );
+      writeFileSync(
+        join(directory, 'package.json'),
+        JSON.stringify({ name, version: '0.0.1' }) + '\n',
       );
     }
   };
@@ -288,7 +301,7 @@ test('changed build output records its main SHA without modifying older releases
   assert.equal(
     repo.remoteGit(
       'show',
-      `${publicationRef}:compas/plugins/${plugin}/index.js`,
+      `${publicationRef}:compas/plugins/${plugin}/snapshot/index.js`,
     ),
     'new plugin build',
   );
@@ -300,6 +313,138 @@ test('changed build output records its main SHA without modifying older releases
     'old build 0.0.1',
   );
   assert.equal(repo.remoteGit('rev-parse', 'main'), repo.mainSha);
+});
+
+test('deploy migrates to nested snapshots while keeping legacy flat files and all build assets', (t) => {
+  const repo = repository(t);
+  repo.git('rm', '-r', 'compas/plugins/history-viewer/snapshot');
+  mkdirSync(join(repo.source, 'compas/plugins', plugin), { recursive: true });
+  writeFileSync(
+    join(repo.source, 'compas/plugins', plugin, 'index.js'),
+    'legacy flat build\n',
+  );
+  repo.publishFiles();
+  repo.build();
+  const directory = join(repo.source, 'dist/apps', plugin);
+  mkdirSync(join(directory, 'assets'));
+  writeFileSync(join(directory, 'assets/icon.svg'), '<svg />\n');
+  writeFileSync(join(directory, '.metadata'), 'hidden build metadata\n');
+  succeeded(repo.run('deploy'));
+  for (const [path, contents] of [
+    ['index.js', 'legacy flat build'],
+    ['snapshot/index.js', bundle.trim()],
+    ['snapshot/assets/icon.svg', '<svg />'],
+    ['snapshot/.metadata', 'hidden build metadata'],
+  ]) {
+    assert.equal(
+      repo.remoteGit(
+        'show',
+        `${publicationRef}:compas/plugins/${plugin}/${path}`,
+      ),
+      contents,
+    );
+  }
+  assert.equal(
+    repo.remoteGit('show', `${publicationRef}:compas/plugins/SNAPSHOT_SHA`),
+    repo.mainSha,
+  );
+});
+
+test('CI supplies missing source manifests without replacing emitted manifests', (t) => {
+  const repo = repository(t);
+  repo.build();
+  const output = join(repo.source, 'dist/apps', plugin, 'package.json');
+  unlinkSync(output);
+  const source = join(repo.source, 'apps', plugin);
+  mkdirSync(source, { recursive: true });
+  const manifest = JSON.stringify({
+    name: plugin,
+    version: '0.0.1',
+    main: './index.js',
+  });
+  writeFileSync(join(source, 'package.json'), manifest);
+  const emitted = join(
+    repo.source,
+    'dist/apps/engineering-wizard/package.json',
+  );
+  const before = readFileSync(emitted);
+  succeeded(repo.run('manifests'));
+  assert.equal(readFileSync(output, 'utf8'), manifest);
+  assert.deepEqual(readFileSync(emitted), before);
+  unlinkSync(output);
+  unlinkSync(join(source, 'package.json'));
+  failed(repo.run('manifests'), /No such file/);
+});
+
+test('release copies all snapshot contents and changes only the released manifest version', (t) => {
+  const repo = repository(t);
+  const directory = join(repo.source, 'compas/plugins', plugin, 'snapshot');
+  const manifest = {
+    name: plugin,
+    version: '0.0.1',
+    main: './index.js',
+    custom: { enabled: true },
+  };
+  const snapshotManifest = JSON.stringify(manifest) + '\n';
+  writeFileSync(join(directory, 'package.json'), snapshotManifest);
+  mkdirSync(join(directory, 'assets'));
+  const files = [
+    ['index.js', bundle],
+    ['style.css', 'body { color: red; }\n'],
+    ['assets/icon.svg', '<svg />\n'],
+    ['.metadata', 'hidden metadata\n'],
+  ];
+  for (const [path, contents] of files)
+    writeFileSync(join(directory, path), contents);
+  repo.publishFiles();
+  succeeded(repo.run('release'));
+  for (const [path] of files) {
+    assert.deepEqual(
+      readFileSync(join(repo.source, 'compas/plugins', plugin, '0.1.0', path)),
+      readFileSync(join(directory, path)),
+    );
+  }
+  assert.deepEqual(
+    JSON.parse(
+      repo.remoteGit(
+        'show',
+        `${publicationRef}:compas/plugins/${plugin}/0.1.0/package.json`,
+      ),
+    ),
+    { ...manifest, version: '0.1.0' },
+  );
+  assert.equal(
+    readFileSync(join(directory, 'package.json'), 'utf8'),
+    snapshotManifest,
+  );
+  const base = 'https://example.invalid/compas/plugins/';
+  assert.equal(
+    new URL('../shared.json', `${base}${plugin}/snapshot/index.js`).href,
+    new URL('../shared.json', `${base}${plugin}/0.1.0/index.js`).href,
+  );
+});
+
+test('missing, malformed or non-object snapshot manifests fail before publication', (t) => {
+  const repo = repository(t);
+  const manifest = join(
+    repo.source,
+    'compas/plugins',
+    plugin,
+    'snapshot/package.json',
+  );
+  const before = repo.remoteGit('rev-parse', publicationRef);
+  unlinkSync(manifest);
+  failed(repo.run('release'), /Snapshot package.json is missing/);
+  for (const invalid of ['{', 'null', '[]']) {
+    writeFileSync(manifest, invalid);
+    failed(repo.run('release'), /SyntaxError|must contain an object/);
+  }
+  assert.equal(repo.remoteGit('rev-parse', publicationRef), before);
+  assert.equal(repo.remoteGit('tag', '--list'), '');
+  assert.equal(
+    existsSync(join(repo.source, 'compas/plugins', plugin, '0.1.0')),
+    false,
+  );
 });
 
 test('an unchanged build cannot invent a source marker for a legacy snapshot', (t) => {
@@ -317,7 +462,7 @@ test('an empty build output fails without changing the published snapshot', (t) 
   const repo = repository(t);
   const before = repo.remoteGit('rev-parse', publicationRef);
   mkdirSync(join(repo.source, 'dist/apps'), { recursive: true });
-  failed(repo.run('deploy'), /cannot stat|No such file/);
+  failed(repo.run('deploy'), /No plugin build output/);
   assert.equal(repo.remoteGit('rev-parse', publicationRef), before);
 });
 
@@ -484,7 +629,7 @@ test('different plugins can tag the same main snapshot without changing main', (
   const repo = repository(t);
   const style = 'body { color: red; }\n';
   writeFileSync(
-    join(repo.source, 'compas/plugins', plugin, 'style.css'),
+    join(repo.source, 'compas/plugins', plugin, 'snapshot', 'style.css'),
     style,
   );
   repo.publishFiles();
@@ -633,7 +778,9 @@ test('concurrent MINOR and MAJOR releases cannot publish two tags for the same p
   assert.equal(
     readdirSync(join(checkout, 'compas/plugins', plugin), {
       withFileTypes: true,
-    }).filter((entry) => entry.isDirectory()).length,
+    }).filter(
+      (entry) => entry.isDirectory() && /^\d+\.\d+\.\d+$/.test(entry.name),
+    ).length,
     1,
   );
 });

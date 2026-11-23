@@ -43,6 +43,11 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      - name: Set up Node.js for release metadata
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
       - name: Fetch main and tags
         id: fetch_refs
         run: |
@@ -82,11 +87,18 @@ jobs:
             exit 1
           fi
 
-          snapshot="compas/plugins/${PLUGIN_NAME}/index.js"
+          snapshot="compas/plugins/${PLUGIN_NAME}/snapshot/index.js"
           if [ ! -f "$snapshot" ]; then
             echo "Snapshot index.js is missing at ${snapshot}. Nothing is published." >&2
             exit 1
           fi
+          snapshot_pkg="compas/plugins/${PLUGIN_NAME}/snapshot/package.json"
+          if [ ! -f "$snapshot_pkg" ]; then
+            echo "Snapshot package.json is missing at ${snapshot_pkg}. Nothing is published." >&2
+            exit 1
+          fi
+          node -e 'const fs=require("fs"); const pkg=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); if (!pkg || typeof pkg !== "object" || Array.isArray(pkg)) throw new Error("Snapshot package.json must contain an object.");' "$snapshot_pkg"
+
           tags=$(git tag --points-at "$snapshot_sha")
           while IFS= read -r tag; do
             if [[ "$tag" =~ ^${PLUGIN_NAME}-[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -206,10 +218,8 @@ jobs:
           set -euo pipefail
           release_dir="compas/plugins/$PLUGIN_NAME/$NEW_RELEASE_VERSION"
           mkdir "$release_dir"
-          cp "compas/plugins/$PLUGIN_NAME/index.js" "$release_dir/index.js"
-          if [ -f "compas/plugins/$PLUGIN_NAME/style.css" ]; then
-            cp "compas/plugins/$PLUGIN_NAME/style.css" "$release_dir/style.css"
-          fi
+          cp -r "compas/plugins/$PLUGIN_NAME/snapshot/." "$release_dir/"
+          node -e 'const fs=require("fs"); const file=process.argv[1]; const version=process.argv[2]; const pkg=JSON.parse(fs.readFileSync(file,"utf8")); pkg.version=version; fs.writeFileSync(file, JSON.stringify(pkg,null,2)+"\n");' "$release_dir/package.json" "$NEW_RELEASE_VERSION"
         env:
           PLUGIN_NAME: ${{ inputs.PLUGIN_NAME_TO_RELEASE }}
           NEW_RELEASE_VERSION: ${{ steps.calculate_new_version.outputs.NEW_RELEASE_VERSION }}

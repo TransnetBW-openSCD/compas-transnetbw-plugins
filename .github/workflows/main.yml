@@ -36,6 +36,25 @@ jobs:
       - name: Build Project
         run: npm run build
 
+      - name: Include plugin manifests in build output
+        id: include_manifests
+        run: |
+          set -euo pipefail
+          found=false
+          for app in dist/apps/*; do
+            [ -d "$app" ] || continue
+            found=true
+            name=$(basename "$app")
+            if [ ! -f "$app/package.json" ]; then
+              echo "Including apps/${name}/package.json in the build artifact."
+              cp "apps/${name}/package.json" "$app/package.json"
+            fi
+          done
+          if [ "$found" = false ]; then
+            echo "No plugin build output found in dist/apps." >&2
+            exit 1
+          fi
+
       - name: Run Tests
         run: npm run test:all
 
@@ -47,6 +66,7 @@ jobs:
         with:
           name: dist
           path: dist
+          include-hidden-files: true
 
   deploy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -74,7 +94,19 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p compas/plugins
-          cp -r dist/apps/* compas/plugins
+          found=false
+          for app in dist/apps/*; do
+            [ -d "$app" ] || continue
+            found=true
+            name=$(basename "$app")
+            dest="compas/plugins/${name}/snapshot"
+            mkdir -p "$dest"
+            cp -r "$app"/. "$dest"/
+          done
+          if [ "$found" = false ]; then
+            echo "No plugin build output found in dist/apps." >&2
+            exit 1
+          fi
 
       - name: Commit and Push Changes
         id: deploy_snapshot
